@@ -152,3 +152,17 @@ jobs:
 
       - name: Test
         run: cargo xtask test
+
+  nix-package:
+    name: Nix package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: cachix/install-nix-action@v31
+
+      - name: Check flake outputs
+        run: nix flake check --no-build
+
+      - name: Build installable package
+        run: nix build --no-link .#disktree

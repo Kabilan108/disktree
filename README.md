@@ -124,6 +124,24 @@ cargo build --release    # target\release\disktree.exe
 
 See [On Windows](#on-windows) for what differs there.
 
+On NixOS, the flake installs the binary, desktop entry, and icon:
+
+```sh
+nix profile install .#disktree
+```
+
+To build the package without installing it, run `nix build .#disktree`. For
+source development, enter the shell before using `make`:
+
+```sh
+nix develop
+make ci
+```
+
+The shell supplies Rust and the native libraries required by GPUI, including
+Fontconfig. If you use direnv, run `direnv allow` once in this checkout. The
+`.envrc` then loads the shell when you enter the directory.
+
 ## Use
 
 ```sh
