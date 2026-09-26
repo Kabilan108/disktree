@@ -23,11 +23,10 @@ use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::os::windows::io::AsRawHandle as _;
 use std::path::{Component, Path, PathBuf, Prefix};
-use std::sync::Arc;
 
 use windows_sys::Win32::Foundation::{
     ERROR_INVALID_FUNCTION, ERROR_INVALID_LEVEL, ERROR_INVALID_PARAMETER,
-    ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED, INVALID_HANDLE_VALUE,
+    ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED, INVALID_HANDLE_VALUE, MAX_PATH,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
@@ -36,7 +35,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ID_EXTD_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
     FileIdExtdDirectoryInfo, FindFirstVolumeW, FindNextVolumeW,
     FindVolumeClose, GetDiskFreeSpaceExW, GetFileInformationByHandleEx,
-    GetVolumePathNameW, GetVolumePathNamesForVolumeNameW, SYNCHRONIZE,
+    GetVolumeInformationW, GetVolumePathNameW,
+    GetVolumePathNamesForVolumeNameW, SYNCHRONIZE,
 };
 
 use crate::space::SpaceInfo;
@@ -73,10 +73,15 @@ pub enum Kind {
 }
 
 /// One directory entry, with what a measurement needs.
+///
+/// The name is decoded to text once, here, since that is what the tree
+/// keeps: the listing hands the walk one allocation per entry, not three.
 #[derive(Debug)]
 pub struct Entry {
-    dir: Arc<Path>,
-    name: OsString,
+    name: Box<str>,
+    /// The name as Windows spells it, only when `name` could not: an
+    /// unpaired surrogate is shown as U+FFFD but must still open.
+    exact: Option<Box<OsStr>>,
     kind: Kind,
     apparent: u64,
     allocated: u64,
@@ -86,12 +91,27 @@ pub struct Entry {
 }
 
 impl Entry {
-    pub fn path(&self) -> PathBuf {
-        self.dir.join(&self.name)
+    /// The entry's path inside `dir`, the directory it was listed from.
+    pub fn path(&self, dir: &Path) -> PathBuf {
+        dir.join(self.file_name())
     }
 
     pub fn file_name(&self) -> &OsStr {
+        self.exact
+            .as_deref()
+            .unwrap_or_else(|| OsStr::new(&*self.name))
+    }
+
+    /// The name as text; see [`Self::file_name`] for what it may lose.
+    pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The name, moved out: the tree keeps it, so nothing copies it. The
+    /// entry's other accessors keep working; `name`, `file_name` and
+    /// `path` do not.
+    pub fn take_name(&mut self) -> Box<str> {
+        std::mem::take(&mut self.name)
     }
 
     pub const fn kind(&self) -> Kind {
@@ -133,7 +153,7 @@ impl Entry {
         self.identity
     }
 
-    fn from_std(dir: &Arc<Path>, entry: &fs::DirEntry) -> io::Result<Self> {
+    fn from_std(entry: &fs::DirEntry) -> io::Result<Self> {
         let meta = entry.metadata()?;
         let file_type = meta.file_type();
         let kind = if file_type.is_symlink() {
@@ -143,9 +163,15 @@ impl Entry {
         } else {
             Kind::File
         };
+        let (name, exact) = match entry.file_name().into_string() {
+            Ok(name) => (name.into_boxed_str(), None),
+            Err(raw) => {
+                (raw.to_string_lossy().into(), Some(raw.into_boxed_os_str()))
+            }
+        };
         Ok(Self {
-            dir: Arc::clone(dir),
-            name: entry.file_name(),
+            name,
+            exact,
             kind,
             apparent: meta.len(),
             allocated: meta.len(),
@@ -162,7 +188,6 @@ impl Entry {
 /// and `..`.
 #[derive(Debug)]
 pub struct ReadDir {
-    dir: Arc<Path>,
     source: Source,
 }
 
@@ -189,7 +214,12 @@ struct Records {
 }
 
 /// List `dir`, with each entry's allocation and file id.
-pub fn read_dir(dir: &Path) -> io::Result<ReadDir> {
+///
+/// `volume` is the serial number of the volume `dir` is on, when the
+/// caller knows it for every directory of a walk (see [`walk_volume`]):
+/// asking per directory is several requests to the file system on top of
+/// the listing. `None` asks.
+pub fn read_dir(dir: &Path, volume: Option<u64>) -> io::Result<ReadDir> {
     let handle = OpenOptions::new()
         .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
         // Needed to open a directory at all. Without
@@ -197,9 +227,11 @@ pub fn read_dir(dir: &Path) -> io::Result<ReadDir> {
         // a walk that chose to enter one wants.
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(dir)?;
-    let volume = winapi_util::file::information(&handle)
-        .ok()
-        .map(|info| info.volume_serial_number());
+    let volume = volume.or_else(|| {
+        winapi_util::file::information(&handle)
+            .ok()
+            .map(|info| info.volume_serial_number())
+    });
     let mut records = Records {
         handle,
         volume,
@@ -207,17 +239,16 @@ pub fn read_dir(dir: &Path) -> io::Result<ReadDir> {
         next: None,
         done: false,
     };
-    let dir: Arc<Path> = Arc::from(dir);
     // The first fill shows whether the file system implements this listing,
     // before any entry has been handed out.
     let source = match records.fill() {
         Ok(()) => Source::Records(records),
         Err(error) if unsupported(&error) => {
-            Source::Std(Box::new(fs::read_dir(&dir)?))
+            Source::Std(Box::new(fs::read_dir(dir)?))
         }
         Err(error) => return Err(error),
     };
-    Ok(ReadDir { dir, source })
+    Ok(ReadDir { source })
 }
 
 impl Iterator for ReadDir {
@@ -227,7 +258,7 @@ impl Iterator for ReadDir {
         let records = match &mut self.source {
             Source::Std(listing) => {
                 return listing.next().map(|entry| {
-                    entry.and_then(|entry| Entry::from_std(&self.dir, &entry))
+                    entry.and_then(|entry| Entry::from_std(&entry))
                 });
             }
             Source::Records(records) => records,
@@ -243,7 +274,7 @@ impl Iterator for ReadDir {
                 }
                 continue;
             };
-            match records.record(&self.dir, offset) {
+            match records.record(offset) {
                 Ok((entry, next)) => {
                     records.next = next;
                     if let Some(entry) = entry {
@@ -304,7 +335,6 @@ impl Records {
     /// the buffer before it is used.
     fn record(
         &self,
-        dir: &Arc<Path>,
         offset: usize,
     ) -> io::Result<(Option<Entry>, Option<usize>)> {
         let malformed =
@@ -333,11 +363,11 @@ impl Records {
                 _ => return Err(malformed()),
             };
 
-        let name: Vec<u16> = name_bytes
+        let units = name_bytes
             .chunks_exact(2)
-            .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
-            .collect();
-        if name == [u16::from(b'.')] || name == [u16::from(b'.'); 2] {
+            .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]));
+        let (name, exact) = decode_name(units);
+        if &*name == "." || &*name == ".." {
             return Ok((None, next));
         }
 
@@ -358,8 +388,8 @@ impl Records {
             header[id_at..id_at + 16].try_into().expect("sixteen"),
         );
         let entry = Entry {
-            dir: Arc::clone(dir),
-            name: OsString::from_wide(&name),
+            name,
+            exact,
             kind,
             apparent: bytes_from(signed(offset_of!(
                 FILE_ID_EXTD_DIR_INFO,
@@ -378,6 +408,27 @@ impl Records {
         };
         Ok((Some(entry), next))
     }
+}
+
+/// A UTF-16 name as text, decoded in one pass; nearly every name is ASCII,
+/// so one code unit is one byte and the text is allocated once, at its
+/// final size. An unpaired surrogate is replaced, and the exact name kept
+/// beside it so the path still opens.
+fn decode_name(
+    units: impl Iterator<Item = u16> + Clone,
+) -> (Box<str>, Option<Box<OsStr>>) {
+    let mut name = String::with_capacity(units.size_hint().0);
+    let mut lossy = false;
+    for unit in char::decode_utf16(units.clone()) {
+        name.push(unit.unwrap_or_else(|_| {
+            lossy = true;
+            char::REPLACEMENT_CHARACTER
+        }));
+    }
+    let exact = lossy.then(|| {
+        OsString::from_wide(&units.collect::<Vec<u16>>()).into_boxed_os_str()
+    });
+    (name.into_boxed_str(), exact)
 }
 
 /// The part of a 128-bit file id that names a file by itself.
@@ -403,15 +454,35 @@ fn file_id(id: u128) -> Option<u64> {
 ///
 /// [MS-FSCC]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fscc/2d3333fe-fc98-4a6f-98a2-4bb805aff407
 pub fn identity(path: &Path) -> Option<(u64, u64)> {
+    let info = information(path)?;
+    let index = info.file_index();
+    (index != 0 && index != u64::MAX)
+        .then(|| (info.volume_serial_number(), index))
+}
+
+/// Serial number of the volume every directory under `canonical` is on,
+/// for a walk that does not follow links. Only a local drive has one:
+/// mounted folders there are reparse points the walk takes for links,
+/// while a share's DFS links are not, and lead to other servers' volumes.
+/// `None` for a share, or when the serial cannot be read.
+pub fn walk_volume(canonical: &Path) -> Option<u64> {
+    let Some(Component::Prefix(prefix)) = canonical.components().next() else {
+        return None;
+    };
+    if !matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)) {
+        return None;
+    }
+    information(canonical).map(|info| info.volume_serial_number())
+}
+
+/// What the file system says about `path`, following links.
+fn information(path: &Path) -> Option<winapi_util::file::Information> {
     let file = OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
         .ok()?;
-    let info = winapi_util::file::information(&file).ok()?;
-    let index = info.file_index();
-    (index != 0 && index != u64::MAX)
-        .then(|| (info.volume_serial_number(), index))
+    winapi_util::file::information(&file).ok()
 }
 
 /// Capacity and free space of the volume holding `path`.
@@ -531,6 +602,119 @@ pub fn is_mount_point(path: &Path) -> bool {
         && volume_root(path).is_some_and(|root| same(&root, path))
 }
 
+/// Whether this process runs as an administrator, with the elevated token
+/// UAC hands out: what reading a volume directly takes.
+pub fn elevated() -> bool {
+    // SAFETY: takes no arguments and only reads the process token.
+    unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 }
+}
+
+/// Whether `root` is a whole drive an administrator would read from its
+/// file table: a drive letter's root, formatted NTFS. Anything else, from
+/// a folder or a mounted folder to another file system, is walked either way.
+pub fn file_table_readable(root: &Path) -> bool {
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let Some(letter) = drive_letter(&canonical) else {
+        return false;
+    };
+    let volume: Vec<u16> = format!("{letter}:\\\0").encode_utf16().collect();
+    let mut name = [0_u16; MAX_PATH as usize + 1];
+    let length = u32::try_from(name.len()).unwrap_or(u32::MAX);
+    // SAFETY: `volume` is NUL-terminated and outlives the call, `name` is
+    // writable for the length passed, and the other outputs may be null.
+    let ok = unsafe {
+        GetVolumeInformationW(
+            volume.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            name.as_mut_ptr(),
+            length,
+        )
+    };
+    let end = name.iter().position(|&unit| unit == 0).unwrap_or(0);
+    ok != 0 && String::from_utf16_lossy(&name[..end]) == "NTFS"
+}
+
+/// Start `program` with `args` as an administrator, through the UAC
+/// prompt. Returns once the prompt is answered; declining it is an error
+/// (`ERROR_CANCELLED`).
+pub fn run_elevated(program: &Path, args: &[OsString]) -> io::Result<()> {
+    let file = wide(program, false)?;
+    let mut line: Vec<u16> = Vec::new();
+    for arg in args {
+        if !line.is_empty() {
+            line.push(u16::from(b' '));
+        }
+        line.extend(quoted(arg));
+    }
+    line.push(0);
+    let verb: Vec<u16> = "runas\0".encode_utf16().collect();
+    // SAFETY: every string is NUL-terminated and outlives the call; a null
+    // window and directory are allowed.
+    let instance = unsafe {
+        windows_sys::Win32::UI::Shell::ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            line.as_ptr(),
+            std::ptr::null(),
+            windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        )
+    };
+    // Anything above 32 is success, by the function's own convention.
+    if instance as usize > 32 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// `C` when `canonical` is the root of drive `C:`; `None` for anything
+/// else, a folder or a volume mounted in one.
+pub fn drive_letter(canonical: &Path) -> Option<char> {
+    let mut components = canonical.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return None;
+    };
+    let (Prefix::Disk(letter) | Prefix::VerbatimDisk(letter)) = prefix.kind()
+    else {
+        return None;
+    };
+    (components.next() == Some(Component::RootDir)
+        && components.next().is_none())
+    .then_some(char::from(letter))
+}
+
+/// `arg` quoted so a program's C runtime splits it back out whole: inside
+/// quotes, backslashes are literal except before a quote, where they must
+/// be doubled, so `C:\` becomes `"C:\\"` and not `"C:\"`.
+fn quoted(arg: &OsStr) -> Vec<u16> {
+    let quote = u16::from(b'"');
+    let backslash = u16::from(b'\\');
+    let mut out = vec![quote];
+    let mut slashes = 0;
+    for unit in arg.encode_wide() {
+        if unit == backslash {
+            slashes += 1;
+            continue;
+        }
+        let run = if unit == quote {
+            2 * slashes + 1
+        } else {
+            slashes
+        };
+        out.extend(std::iter::repeat_n(backslash, run));
+        slashes = 0;
+        out.push(unit);
+    }
+    out.extend(std::iter::repeat_n(backslash, 2 * slashes));
+    out.push(quote);
+    out
+}
+
 /// Whether `left` and `right` name the same place, compared the way Windows
 /// compares names: see [`folded`].
 pub fn same(left: &Path, right: &Path) -> bool {
@@ -615,11 +799,41 @@ fn bytes_from(value: i64) -> u64 {
 }
 
 /// A `FILETIME` as Unix seconds, `0` before 1970.
-const fn unix_seconds(ticks: i64) -> i64 {
+pub const fn unix_seconds(ticks: i64) -> i64 {
     if ticks <= EPOCH_TICKS {
         0
     } else {
         (ticks - EPOCH_TICKS) / TICKS_PER_SECOND
+    }
+}
+
+/// Bytes aligned to a page, for reads that bypass the file cache: those
+/// want memory aligned to the disk's sector, which a page always is.
+#[derive(Debug, Default)]
+pub struct Aligned {
+    pages: Vec<Page>,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C, align(4096))]
+struct Page([u8; 4096]);
+
+impl Aligned {
+    /// `len` bytes, their contents whatever the last use left.
+    pub fn bytes(&mut self, len: usize) -> &mut [u8] {
+        let pages = len.div_ceil(size_of::<Page>());
+        if self.pages.len() < pages {
+            self.pages.resize(pages, Page([0; 4096]));
+        }
+        // SAFETY: `Page` is a `repr(C)` byte array, so the pages are one
+        // allocation of initialized bytes with no padding, and `len` fits
+        // in it; the borrow of `self` keeps it alive and unaliased.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.pages.as_mut_ptr().cast::<u8>(),
+                len,
+            )
+        }
     }
 }
 
@@ -644,6 +858,17 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn quoted_arguments_survive_the_command_line() {
+        let quote =
+            |arg: &str| String::from_utf16(&quoted(OsStr::new(arg))).unwrap();
+        // A drive root's trailing backslash would otherwise escape the quote.
+        assert_eq!(quote(r"C:\"), r#""C:\\""#);
+        assert_eq!(quote(r"C:\Program Files\x"), r#""C:\Program Files\x""#);
+        assert_eq!(quote(r#"a\"b"#), r#""a\\\"b""#);
+        assert_eq!(quote("--metric"), r#""--metric""#);
+    }
+
+    #[test]
     fn the_volume_list_has_the_system_drive() {
         let drive =
             std::env::var_os("SystemDrive").unwrap_or_else(|| "C:".into());
@@ -657,7 +882,7 @@ mod tests {
     }
 
     fn listed(dir: &Path) -> Vec<Entry> {
-        let mut entries: Vec<Entry> = read_dir(dir)
+        let mut entries: Vec<Entry> = read_dir(dir, None)
             .expect("list")
             .collect::<io::Result<_>>()
             .expect("entries");
@@ -677,9 +902,38 @@ mod tests {
         assert_eq!(names, ["data.bin", "sub"]);
         assert_eq!(entries[0].kind(), Kind::File);
         assert_eq!(entries[0].apparent(), 100_000);
-        assert_eq!(entries[0].path(), temp.path().join("data.bin"));
+        assert_eq!(entries[0].path(temp.path()), temp.path().join("data.bin"));
         assert_eq!(entries[1].kind(), Kind::Directory);
         assert!(entries[0].modified() > 0, "written just now");
+    }
+
+    #[test]
+    fn a_name_that_is_not_text_is_shown_lossy_and_still_opens() {
+        use std::os::windows::ffi::OsStringExt as _;
+        let temp = TempDir::new().expect("tempdir");
+        // An unpaired surrogate: NTFS takes it, text cannot hold it.
+        let raw =
+            OsString::from_wide(&[u16::from(b'a'), 0xD800, u16::from(b'b')]);
+        fs::write(temp.path().join(&raw), b"x").expect("write");
+
+        let entries = listed(temp.path());
+        let [entry] = &entries[..] else {
+            panic!("one entry: {}", entries.len());
+        };
+        assert_eq!(entry.name(), "a\u{FFFD}b");
+        assert_eq!(entry.file_name(), raw);
+        assert!(fs::metadata(entry.path(temp.path())).is_ok());
+    }
+
+    #[test]
+    fn only_a_local_drive_gives_a_walk_one_volume() {
+        let temp = TempDir::new().expect("tempdir");
+        let canonical = temp.path().canonicalize().expect("canonical");
+        assert!(walk_volume(&canonical).is_some(), "{}", canonical.display());
+        // A share's DFS links lead to other volumes; nothing is asked.
+        for share in [r"\\server\share\dir", r"\\?\UNC\server\share\dir"] {
+            assert_eq!(walk_volume(Path::new(share)), None, "{share}");
+        }
     }
 
     #[test]
@@ -746,11 +1000,15 @@ mod tests {
         };
         assert_eq!(kind("junction"), Some(Kind::Link));
         assert_eq!(kind("target"), Some(Kind::Directory));
-        let through: Vec<OsString> = listed(&junction)
+        let through: Vec<Box<str>> = listed(&junction)
             .into_iter()
             .map(|entry| entry.name)
             .collect();
-        assert_eq!(through, ["inside.bin"], "a walk that enters one follows");
+        assert_eq!(
+            &*through[0], "inside.bin",
+            "a walk that enters one follows"
+        );
+        assert_eq!(through.len(), 1);
     }
 
     #[test]
@@ -794,6 +1052,7 @@ mod tests {
             drive.display()
         );
         assert!(!is_mount_point(temp.path()));
+        assert!(!file_table_readable(temp.path()), "a folder is walked");
         assert!(!is_mount_point(drive), "a drive is a root, not a folder");
     }
 
