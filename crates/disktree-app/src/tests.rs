@@ -467,6 +467,27 @@ fn the_help_overlay_opens_and_closes(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn the_volume_picker_opens_moves_and_closes(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    // The picker lists volumes and draws them without panicking; Escape
+    // leaves the scan where it was.
+    press(cx, "v");
+    assert!(read(&view, cx, |app| app.volumes_open));
+    draw(cx);
+    assert!(cx.debug_bounds("disktree-root").is_some());
+    let before = read(&view, cx, |app| app.root_path.clone());
+    press(cx, "down");
+    press(cx, "up");
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.volumes_open));
+    assert_eq!(read(&view, cx, |app| app.root_path.clone()), before);
+}
+
+#[gpui_kit::test]
 fn showing_a_tile_that_is_gone_says_so_instead(cx: &mut TestAppContext) {
     cx.update(gpui_omarchy::init);
     let temp = fixture();

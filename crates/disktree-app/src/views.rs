@@ -111,10 +111,82 @@ pub fn root(
     if app.show_help {
         root = root.child(help_overlay(app, cx));
     }
+    if app.volumes_open {
+        root = root.child(volumes_dialog(app, cx));
+    }
     if app.confirm_open {
         root = root.child(delete_dialog(app, cx));
     }
     root
+}
+
+/// Picking another volume scans it from scratch: the picker lists every
+/// volume with its free space, and the choice is the new root.
+fn volumes_dialog(
+    app: &Disktree,
+    cx: &mut Context<'_, Disktree>,
+) -> impl IntoElement {
+    let theme = cx.omarchy().clone();
+    let cancel = cx.entity().downgrade();
+    let mut rows = div().flex().flex_col().gap(space::XS);
+    if app.volumes.is_empty() {
+        rows = rows
+            .child(dialog_description("No other volume could be read.", cx));
+    }
+    for (index, volume) in app.volumes.iter().enumerate() {
+        let highlighted = index == app.volume_highlight;
+        let free = volume.space.map_or_else(
+            || "unknown free".to_string(),
+            |space| format!("{} free", human_bytes(space.available)),
+        );
+        let label = match &volume.device {
+            Some(device) => format!(
+                "{}  \u{00b7}  {device}  \u{00b7}  {free}",
+                volume.point.display()
+            ),
+            None => format!("{}  \u{00b7}  {free}", volume.point.display()),
+        };
+        rows = rows.child(
+            div()
+                .id(ElementId::Name(format!("volume-{index}").into()))
+                .px(space::MD)
+                .py(space::SM)
+                .text_size(text::BODY)
+                .text_color(if highlighted {
+                    theme.bright
+                } else {
+                    theme.foreground
+                })
+                // Only the row the keys are on is tinted: a second highlight
+                // would read as a second selection.
+                .when(highlighted, |row| row.bg(theme.accent.opacity(0.18)))
+                .hover(|row| row.bg(theme.accent.opacity(0.1)))
+                .child(label)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.volume_highlight = index;
+                    this.choose_volume(cx);
+                    window.focus(&this.focus, cx);
+                })),
+        );
+    }
+    let popup = dialog_popup(cx)
+        .child(dialog_title("Scan a volume", cx))
+        .child(dialog_description(
+            "Up and down moves, Enter scans it, Escape stays here.",
+            cx,
+        ))
+        .child(rows);
+    alert_dialog(&app.confirm_focus, cx)
+        .open(true)
+        .on_cancel(move |_, window, cx| {
+            let _ = cancel.update(cx, |this, cx| {
+                this.volumes_open = false;
+                cx.notify();
+                this.apply_focus(window, cx);
+            });
+            false
+        })
+        .popup(popup)
 }
 
 /// The one question disktree asks: a permanent deletion cannot be undone, so
@@ -1588,19 +1660,30 @@ fn disk_section(
     cx: &Context<'_, Disktree>,
 ) -> Div {
     let device = app.device.clone().unwrap_or_default();
-    let mut section = div().flex().flex_col().gap(space::SM).child(
-        div()
-            .flex()
-            .flex_row()
-            .gap(space::SM)
-            .child(widgets::eyebrow("Disk", cx))
-            .child(
-                div()
-                    .text_size(text::CAPTION)
-                    .text_color(theme.secondary.opacity(0.6))
-                    .child(device),
-            ),
-    );
+    // The disk header doubles as the way to another volume: it opens the
+    // picker, like `V` does. A plain label would hide that the scan can move.
+    let header = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(space::SM)
+        .child(widgets::eyebrow("Disk", cx))
+        .child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary.opacity(0.6))
+                .child(device),
+        )
+        .child(div().flex_1())
+        .child(
+            button("volumes", "Volumes", ButtonVariant::Secondary, cx)
+                .tab_stop(false)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_volumes(cx);
+                    window.focus(&this.focus, cx);
+                })),
+        );
+    let mut section = div().flex().flex_col().gap(space::SM).child(header);
     let Some(space_info) = app.space else {
         return section.child(
             div()
@@ -1751,7 +1834,7 @@ fn review_button(
 /// to every other key and the scan's own numbers hold the trailing edge.
 fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
     // Most useful first, so a narrow window clips the least useful.
-    let hints: [(&str, &str); 10] = [
+    let hints: [(&str, &str); 11] = [
         ("space", "mark"),
         ("enter", "open"),
         ("\u{232b}", "up"),
@@ -1761,6 +1844,7 @@ fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
         ("[ ]", "depth"),
         ("t", "mode"),
         ("0", "reset"),
+        ("v", "volumes"),
         ("r", "rescan"),
     ];
     let mut lane = div()
@@ -2995,7 +3079,7 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
     let theme = cx.omarchy();
     // Sentence case, and the tile a key acts on is always the one under the
     // pointer if the pointer moved last, else the keyboard selection.
-    let rows: [(&str, &str); 27] = [
+    let rows: [(&str, &str); 28] = [
         ("space / x", "Mark or unmark the tile you point at"),
         (MODIFIER_CLICK, "Mark without moving the selection"),
         ("enter", "Open that directory, at any depth"),
@@ -3021,6 +3105,7 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
         ("c", "Review the marked list"),
         ("t", "Size, files or age: what areas and colours say"),
         ("r", "Scan again from the same root"),
+        ("v", "Scan another volume"),
         (MODIFIER_OPEN, "Choose another directory to scan"),
         ("g", "The whole disk; click any directory above to widen"),
         ("d", "Disk usage or apparent size"),

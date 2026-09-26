@@ -419,6 +419,12 @@ pub struct Disktree {
     /// The top of the disk the scanned root lives on: what "Whole disk"
     /// scans. Follows the root when a folder is opened.
     pub disk_root: Option<PathBuf>,
+    /// The volume picker: open, what it listed, and which row the keys are
+    /// on. `None` when closed; empty when no volume besides the current one
+    /// could be read.
+    pub volumes_open: bool,
+    pub volumes: Vec<disktree_core::space::Volume>,
+    pub volume_highlight: usize,
     /// The side panel's width, in rem; dragged from its left edge.
     pub panel_rems: f32,
     pub scan_started: Option<Instant>,
@@ -506,6 +512,9 @@ impl Disktree {
             device: None,
             full_disk_access: None,
             disk_root: None,
+            volumes_open: false,
+            volumes: Vec::new(),
+            volume_highlight: 0,
             panel_rems: PANEL_REMS,
             scan_started: None,
             scan_root: PathBuf::new(),
@@ -596,6 +605,68 @@ impl Disktree {
             Some(known),
         ));
         Self::poll_scan(epoch, cx);
+        cx.notify();
+    }
+
+    /// `V`: list every volume and let the scan move to one. The in-flight walk
+    /// is left alone until a volume is picked; picking calls [`set_root`],
+    /// which cancels it.
+    pub fn open_volumes(&mut self, cx: &mut Context<'_, Self>) {
+        let mut volumes = disktree_core::space::volumes();
+        // The current disk is always offered, even when the table misses it:
+        // it is the one row that is never wrong.
+        if let Some(root) = volume_root_for(&self.root_path)
+            && !volumes.iter().any(|volume| volume.point == root)
+        {
+            volumes.push(disktree_core::space::Volume {
+                point: root.clone(),
+                device: device_for(&root),
+                space: space_info(&root).ok(),
+            });
+        }
+        volumes.retain(|volume| volume.point != self.root_path);
+        self.volume_highlight = 0;
+        self.volumes = volumes;
+        self.volumes_open = true;
+        cx.notify();
+    }
+
+    /// Scan the highlighted volume from scratch; closes the picker when there
+    /// is nothing to pick.
+    pub fn choose_volume(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(point) = self
+            .volumes
+            .get(self.volume_highlight)
+            .map(|volume| volume.point.clone())
+        else {
+            self.volumes_open = false;
+            cx.notify();
+            return;
+        };
+        self.volumes_open = false;
+        self.volumes.clear();
+        self.set_root(point, cx);
+    }
+
+    /// Move the highlight in the open picker, wrapping at the ends.
+    pub fn move_volume_highlight(
+        &mut self,
+        step: i32,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.volumes.is_empty() {
+            return;
+        }
+        let len = self.volumes.len();
+        let at = self.volume_highlight;
+        // Picker steps are ±1, but wrap either way without casting the length
+        // down to a narrower type.
+        let next = match step.signum() {
+            1 => (at + 1) % len,
+            -1 => at.checked_sub(1).unwrap_or(len - 1),
+            _ => at,
+        };
+        self.volume_highlight = next;
         cx.notify();
     }
 
@@ -2259,6 +2330,26 @@ impl Disktree {
             return;
         }
 
+        // The volume picker owns its keys while open: arrows move, Enter
+        // picks, Escape closes, and nothing behind it acts.
+        if self.volumes_open {
+            match key {
+                "escape" => {
+                    self.volumes_open = false;
+                    cx.notify();
+                }
+                "enter" => self.choose_volume(cx),
+                "up" | "k" if !control => {
+                    self.move_volume_highlight(-1, cx);
+                }
+                "down" | "j" if !control => {
+                    self.move_volume_highlight(1, cx);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // ⌘ chords belong to the menu bar (⌘Q, ⌘W, ⌘R) or to the system.
         // Read as plain letters they would act twice or by surprise: ⌘D
         // would re-scan with apparent sizes, ⌘H would hide *and* toggle.
@@ -2430,6 +2521,7 @@ impl Disktree {
             }
             "r" if !control => self.start_scan(cx),
             "g" if !control => self.go_to_disk(cx),
+            "v" if !control && !shift => self.open_volumes(cx),
             "i" if !control => {
                 self.options.include_hidden = !self.options.include_hidden;
                 self.start_scan(cx);
