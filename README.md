@@ -211,6 +211,7 @@ and shows how much free space was actually gained.
 | `d` | disk usage or apparent size |
 | `i` | include or skip hidden entries |
 | `r` | scan again |
+| `v` | scan another mounted volume |
 | `ctrl o` (`⌘O` on macOS) | choose another directory to scan |
 | `g` | the whole disk |
 | `p` | show or hide the selection line |
@@ -244,6 +245,14 @@ The scan follows [dust](https://github.com/bootandy/dust)'s approach: one rayon
 scope per root, a completion counter per directory so no directory is built
 before its last subdirectory lands, and one bottom-up pass that aggregates sizes
 and removes duplicate hardlinks.
+
+## Switching volumes
+
+Press `v` (or click **Volumes** beside the disk name in the side panel) to
+bring up the volume picker. It lists every candidate volume mounted on the
+system together with its free space, ordered fullest first, filtering out
+pseudo-filesystems and duplicate btrfs/APFS mount points. Selecting any
+entry resets the scan root directly to that volume.
 
 ## The whole disk
 
