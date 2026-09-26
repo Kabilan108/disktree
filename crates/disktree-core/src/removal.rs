@@ -400,6 +400,15 @@ fn refuse(
     if home_key.is_some_and(|home| home.starts_with(&key)) {
         return Some("it contains the home directory".into());
     }
+    // Elevated through another account's credentials, home is that admin's,
+    // and the user's own profile is just another folder; elevation opens
+    // every other profile too. So on Windows each directory in the profiles
+    // folder (`C:\Users\tobi`, `Public`, `Default`) is refused, taken from
+    // Windows and not from home, whose parent could be anything. What is
+    // inside a profile stays removable, as under one's own home.
+    if profiles_key().is_some_and(|profiles| is_profile(path, &key, profiles)) {
+        return Some("a user profile cannot be removed".into());
+    }
     // By spelling too: the Data volume's root keeps its name as a key, while
     // everything under it is keyed as under `/`.
     if !key.starts_with(&root_key) && !path.starts_with(root) {
@@ -614,6 +623,29 @@ fn windows_mount_points() -> Vec<PathBuf> {
 #[cfg(not(windows))]
 const fn windows_mount_points() -> Vec<PathBuf> {
     Vec::new()
+}
+
+/// The key of the folder every user profile is in, `C:\Users` as
+/// installed; asked of Windows once, since it does not move while running.
+#[cfg(windows)]
+fn profiles_key() -> Option<&'static Path> {
+    static PROFILES: std::sync::LazyLock<Option<PathBuf>> =
+        std::sync::LazyLock::new(|| {
+            crate::windows::user_profiles_dir().map(|dir| guard_key(&dir))
+        });
+    PROFILES.as_deref()
+}
+
+#[cfg(not(windows))]
+const fn profiles_key() -> Option<&'static Path> {
+    None
+}
+
+/// Whether `path`, keyed `key`, is a profile: a directory directly in
+/// `profiles`. A file or a link there is no profile and stays removable.
+fn is_profile(path: &Path, key: &Path, profiles: &Path) -> bool {
+    key.parent() == Some(profiles)
+        && fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
 }
 
 /// A mount point strictly inside the path keyed `key`, if there is one. A
@@ -927,6 +959,18 @@ fn run(
             bytes: target.bytes,
             outcome: outcome.map_err(|error| error.to_string()),
         });
+    }
+
+    // NTFS writes the file table's records lazily, and the elevated rescan
+    // of a whole drive reads that table from disk, past the cache:
+    // unflushed, the removed entries would still show. Only then; a folder
+    // is walked. Failing only lets the table lag again.
+    #[cfg(windows)]
+    if removed > 0
+        && plan.root.parent().is_none()
+        && crate::access::administrator() == Some(true)
+    {
+        let _ = crate::windows::flush_volume(&plan.root);
     }
 
     let _ = sender.send(RemovalEvent::Done {
@@ -1479,7 +1523,7 @@ mod tests {
         assert_eq!(
             refuse(Path::new("/home/other"), Path::new("/"), Some(&home), &[]),
             None,
-            "a sibling of home is not"
+            "a sibling of home is not above it"
         );
     }
 
@@ -2153,6 +2197,31 @@ mod tests {
                 .contains(&windows.to_lowercase())),
             "refused as part of {windows}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_profiles_are_refused() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let profiles = temp.path();
+        fs::create_dir_all(profiles.join(r"tobi\Downloads")).expect("mkdir");
+        fs::write(profiles.join("notes.txt"), b"x").expect("write");
+        let profile = |relative: &str| {
+            let path = profiles.join(relative);
+            is_profile(&path, &guard_key(&path), &guard_key(profiles))
+        };
+        assert!(profile("tobi"));
+        assert!(profile("TOBI"), "compared as Windows compares names");
+        assert!(!profile("notes.txt"), "a file there is no profile");
+        assert!(!profile(r"tobi\Downloads"), "inside a profile is not one");
+        assert!(!profile("gone"), "nothing there is no profile");
+
+        // The rule itself, against the profiles folder Windows reports.
+        let public = crate::windows::user_profiles_dir()
+            .expect("profiles folder")
+            .join("Public");
+        let reason = refuse(&public, &system_drive(), None, &[]);
+        assert!(reason.is_some_and(|reason| reason.contains("profile")));
     }
 
     #[test]

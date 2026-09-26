@@ -33,6 +33,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_ID_EXTD_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     FileIdExtdDirectoryInfo, FindFirstVolumeW, FindNextVolumeW,
     FindVolumeClose, GetDiskFreeSpaceExW, GetFileInformationByHandleEx,
     GetVolumeInformationW, GetVolumePathNameW,
@@ -672,6 +673,24 @@ pub fn run_elevated(program: &Path, args: &[OsString]) -> io::Result<()> {
     }
 }
 
+/// Write out what the file system holds only in memory for the volume
+/// holding `path`, its file table included. Flushing a volume takes write
+/// access, so an administrator. Only a volume mounted as a drive letter:
+/// for one mounted in a folder, `\\.\X:` would name the drive around it.
+pub fn flush_volume(path: &Path) -> io::Result<()> {
+    let root = volume_root(path).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "no volume holds the path")
+    })?;
+    let letter = drive_letter(&root)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::Unsupported))?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(format!(r"\\.\{letter}:"))?
+        .sync_all()
+}
+
 /// `C` when `canonical` is the root of drive `C:`; `None` for anything
 /// else, a folder or a volume mounted in one.
 pub fn drive_letter(canonical: &Path) -> Option<char> {
@@ -686,6 +705,44 @@ pub fn drive_letter(canonical: &Path) -> Option<char> {
     (components.next() == Some(Component::RootDir)
         && components.next().is_none())
     .then_some(char::from(letter))
+}
+
+/// The folder that holds every user's profile, `C:\Users` as installed,
+/// from Windows itself: it can be moved, so no path is assumed. `None`
+/// when Windows does not say.
+pub fn user_profiles_dir() -> Option<PathBuf> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_UserProfiles, SHGetKnownFolderPath,
+    };
+    let mut raw: *mut u16 = std::ptr::null_mut();
+    // SAFETY: the id outlives the call, a null token means this user, and
+    // `raw` receives a string the shell allocates, freed below either way.
+    let result = unsafe {
+        SHGetKnownFolderPath(
+            &FOLDERID_UserProfiles,
+            0,
+            std::ptr::null_mut(),
+            &raw mut raw,
+        )
+    };
+    let path = (result >= 0 && !raw.is_null()).then(|| {
+        // SAFETY: on success `raw` is a NUL-terminated string, read up to
+        // and not past its NUL.
+        unsafe {
+            let mut len = 0;
+            while *raw.add(len) != 0 {
+                len += 1;
+            }
+            PathBuf::from(OsString::from_wide(std::slice::from_raw_parts(
+                raw, len,
+            )))
+        }
+    });
+    // SAFETY: `raw` came from the shell's allocator, or is null, which
+    // the call accepts.
+    unsafe { CoTaskMemFree(raw.cast()) };
+    path
 }
 
 /// `arg` quoted so a program's C runtime splits it back out whole: inside
