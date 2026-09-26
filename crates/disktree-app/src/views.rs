@@ -1003,6 +1003,7 @@ fn side_panel(
         )
         .children(notice_line(app, theme, cx))
         .children(privacy_line(app, theme, cx))
+        .children(administrator_line(app, theme, cx))
         .child(disk_section(app, theme, cx))
 }
 
@@ -1575,6 +1576,77 @@ fn privacy_line(
                             disktree_core::access::FULL_DISK_ACCESS_SETTINGS,
                         );
                         window.focus(&this.focus, cx);
+                    },
+                )),
+            ),
+    )
+}
+
+/// The faster, fuller scan an administrator gets on Windows, and the way to
+/// it. Only where it would help: on a whole NTFS drive walked without `-l`,
+/// which is then read from its file table instead, or once the walk was
+/// refused something. Hidden once asked, and while a removal runs, which a
+/// restart would cut short.
+fn administrator_line(
+    app: &Disktree,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Option<Div> {
+    if app.administrator != Some(false) || app.restarting || app.run.is_some() {
+        return None;
+    }
+    let errors = app.progress.errors;
+    let message = if errors > 0 {
+        let noun = if errors == 1 { "item" } else { "items" };
+        // With `-l` the elevated copy walks too: only the reading is gained.
+        let faster = if app.options.follow_links {
+            ""
+        } else {
+            ", and a whole drive several times faster"
+        };
+        format!(
+            "Windows kept {} {noun} unreadable. Run as administrator to read \
+             them{faster}.",
+            widgets::human_count(errors)
+        )
+    } else if app.file_table && !app.options.follow_links {
+        "Run as administrator to read the whole drive from its file table: \
+         several times faster than this walk."
+            .to_owned()
+    } else {
+        return None;
+    };
+    // Marks live only in this process; the new one starts without them.
+    let message = if app.marks.is_empty() {
+        message
+    } else {
+        format!("{message} Restarting drops the marks.")
+    };
+    let color = theme.warning;
+    Some(
+        div()
+            .flex()
+            .flex_col()
+            .gap(space::SM)
+            .px(space::SM)
+            .py(space::SM)
+            .border_1()
+            .border_color(color.opacity(0.5))
+            .text_size(text::CAPTION)
+            .child(div().text_color(color).child(message))
+            .child(
+                button(
+                    "administrator",
+                    "Restart as Administrator",
+                    ButtonVariant::Outline,
+                    cx,
+                )
+                .tab_stop(false)
+                .justify_center()
+                .on_click(cx.listener(
+                    |this, _, window, cx| {
+                        window.focus(&this.focus, cx);
+                        this.restart_as_administrator(cx);
                     },
                 )),
             ),
