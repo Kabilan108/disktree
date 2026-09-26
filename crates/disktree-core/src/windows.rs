@@ -334,8 +334,10 @@ impl Records {
             };
 
         let name: Vec<u16> = name_bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_ne_bytes(*pair))
             .collect();
         if name == [u16::from(b'.')] || name == [u16::from(b'.'); 2] {
             return Ok((None, next));
