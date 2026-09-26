@@ -2826,9 +2826,9 @@ fn card_surface(cx: &gpui_kit::App) -> Div {
 /// at the pointer, over the button itself.
 fn history_card(app: &Disktree, back: bool, cx: &gpui_kit::App) -> Div {
     let (label, keys) = if back {
-        ("Back", "alt \u{2190} back")
+        ("Back", "alt \u{2190} \u{00b7} side button")
     } else {
-        ("Forward", "alt \u{2192} forward")
+        ("Forward", "alt \u{2192} \u{00b7} side button")
     };
     let card = app
         .history_target(back)
@@ -3002,7 +3002,7 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
         ("\u{232b} / esc", "Go up one directory"),
         (
             "alt \u{2190} / \u{2192}",
-            "Back or forward through where you have been",
+            "Back or forward, as do the mouse's side buttons",
         ),
         (
             "\u{2190} \u{2191} \u{2193} \u{2192}",

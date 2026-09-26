@@ -1322,3 +1322,51 @@ fn back_and_forward_retrace_where_you_have_been(cx: &mut TestAppContext) {
         Vec::<usize>::new()
     );
 }
+
+/// The mouse's back and forward buttons retrace the same history as
+/// alt-arrows and the header buttons, and only on the explore screen.
+#[gpui_kit::test]
+fn mouse_side_buttons_go_back_and_forward(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, MouseButton, NavigationDirection};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    draw(cx);
+
+    let (junk, deeper) = update(&view, cx, |app, cx| {
+        let junk = child_crumbs(app, &[], "junk");
+        let deeper = child_crumbs(app, &junk, "deeper");
+        app.select(Some(junk.clone()), cx);
+        app.descend(cx);
+        app.select(Some(deeper.clone()), cx);
+        app.descend(cx);
+        (junk, deeper)
+    });
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.crumbs.clone()), deeper);
+
+    // Over the mosaic, buttons 8 and 9 step the history, as alt-arrows do.
+    let mosaic = cx.debug_bounds("treemap").expect("the mosaic is drawn");
+    let at = mosaic.center();
+    let press_button = |cx: &mut Window, button: MouseButton| {
+        cx.simulate_mouse_move(at, None, Modifiers::none());
+        cx.simulate_mouse_down(at, button, Modifiers::none());
+        cx.simulate_mouse_up(at, button, Modifiers::none());
+        draw(cx);
+    };
+    press_button(cx, MouseButton::Navigate(NavigationDirection::Back));
+    assert_eq!(read(&view, cx, |app| app.crumbs.clone()), junk);
+    press_button(cx, MouseButton::Navigate(NavigationDirection::Forward));
+    assert_eq!(read(&view, cx, |app| app.crumbs.clone()), deeper);
+
+    // On the review screen the same press changes nothing: the marked list
+    // is not somewhere the history can take you back to.
+    update(&view, cx, |app, cx| app.toggle_mark(&junk, cx));
+    press(cx, "c");
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
+    press_button(cx, MouseButton::Navigate(NavigationDirection::Back));
+    assert_eq!(read(&view, cx, |app| app.crumbs.clone()), deeper);
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
+}
