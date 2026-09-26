@@ -13,7 +13,7 @@ use gpui_kit::base::CheckboxState;
 use gpui_kit::{
     App, AppContext as _, ClickEvent, Context, Div, DragMoveEvent, ElementId,
     FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent,
-    ParentElement, Rems, SharedString, Stateful,
+    MouseDownEvent, ParentElement, Rems, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled, Window, anchored, deferred, div,
     pattern_slash, px, relative,
 };
@@ -128,7 +128,12 @@ fn volumes_dialog(
 ) -> impl IntoElement {
     let theme = cx.omarchy().clone();
     let cancel = cx.entity().downgrade();
-    let mut rows = div().flex().flex_col().gap(space::XS);
+    let mut rows = div()
+        .id("volume-rows")
+        .debug_selector(|| "volume-rows".into())
+        .flex()
+        .flex_col()
+        .gap(space::XS);
     if app.volumes.is_empty() {
         rows = rows
             .child(dialog_description("No other volume could be read.", cx));
@@ -176,6 +181,16 @@ fn volumes_dialog(
             cx,
         ))
         .child(rows);
+    let centred = centred_popup(popup, {
+        let close = cancel.clone();
+        move |_, window, cx| {
+            let _ = close.update(cx, |this, cx| {
+                this.volumes_open = false;
+                cx.notify();
+                this.apply_focus(window, cx);
+            });
+        }
+    });
     alert_dialog(&app.confirm_focus, cx)
         .open(true)
         .on_cancel(move |_, window, cx| {
@@ -186,7 +201,42 @@ fn volumes_dialog(
             });
             false
         })
-        .popup(popup)
+        .popup(centred)
+}
+
+/// Put a dialog's popup in the middle of the window, and close it when a
+/// click lands outside it.
+///
+/// The base dialog hosts its popup as an ordinary child of a full-window box,
+/// so a popup lands in the top-left corner unless something centres it. That
+/// something ends up in front of the backdrop, which is what used to receive
+/// the click that dismisses a dialog, so the click is taken here instead. The
+/// card stops a mouse-down from reaching this wrapper, so a click on the
+/// dialog itself stays the dialog's own.
+fn centred_popup(
+    card: impl IntoElement,
+    on_outside: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id("dialog-outside")
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        // Any button, as the backdrop took them: a right-click outside closes
+        // the dialog too.
+        .on_any_mouse_down(on_outside)
+        .child(
+            div()
+                .id("dialog-card")
+                .on_any_mouse_down(
+                    |_: &MouseDownEvent, _: &mut Window, cx: &mut App| {
+                        cx.stop_propagation();
+                    },
+                )
+                .child(card),
+        )
 }
 
 /// The one question disktree asks: a permanent deletion cannot be undone, so
@@ -243,6 +293,17 @@ fn delete_dialog(
         .child(dialog_title(title, cx))
         .child(dialog_description(body, cx))
         .child(actions);
+    // Built before the chain below, which moves `cancel` into its own
+    // handler for Escape.
+    let centred = centred_popup(popup, {
+        let close = cancel.clone();
+        move |_, window, cx| {
+            let _ = close.update(cx, |this, cx| {
+                this.cancel_delete(cx);
+                this.apply_focus(window, cx);
+            });
+        }
+    });
     alert_dialog(&app.confirm_focus, cx)
         .open(true)
         .on_ok(move |_, window, cx| {
@@ -259,7 +320,7 @@ fn delete_dialog(
             });
             false
         })
-        .popup(popup)
+        .popup(centred)
 }
 
 // ── explore ─────────────────────────────────────────────────────────────
