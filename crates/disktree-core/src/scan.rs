@@ -726,7 +726,6 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
     let root_dir = Arc::new(PendingDir::new(root.to_path_buf(), None, 0));
     let mut threads = context.options.threads.normalized();
     threads.max_threads = threads.max_threads.min(rayon::current_num_threads());
-    let admission = Arc::new(Admission::new(root_dir, threads.max_threads));
     context
         .progress
         .threads
@@ -739,7 +738,15 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
         .progress
         .thread_tuning_complete
         .store(!threads.adaptive, Ordering::Relaxed);
+    if !threads.adaptive && threads.max_threads == rayon::current_num_threads()
     {
+        // Pool-sized fixed scans need no admission lock or ready queue. Keep
+        // existing core callers on Rayon's direct scheduling path.
+        rayon::scope(|scope| {
+            dispatch_fixed(scope, &root_dir, context);
+        });
+    } else {
+        let admission = Arc::new(Admission::new(root_dir, threads.max_threads));
         // The controller owns no Rayon worker and is joined before finishing
         // the tree, where entry throughput no longer describes useful work.
         let _controller = ControllerGuard::spawn(
@@ -757,6 +764,19 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
         io::Error::other(format!("{} produced no tree", root.display()))
     })?;
     Ok(finish_tree(node, &context.options))
+}
+
+fn dispatch_fixed(
+    scope: &Scope<'_>,
+    dir: &Arc<PendingDir>,
+    context: &Arc<WalkContext>,
+) {
+    for child in walk(dir, context) {
+        let context = Arc::clone(context);
+        scope.spawn(move |scope| {
+            dispatch_fixed(scope, &child, &context);
+        });
+    }
 }
 
 /// Read one directory, spawn a task per subdirectory, then report completion.
@@ -1099,7 +1119,7 @@ mod tests {
         for index in 0..96 {
             write(temp.path(), &format!("d{index}/nested/file"), index + 1);
         }
-        for threads in [1, 2, 4, 8] {
+        for threads in [1, 2, 4, 8, usize::MAX] {
             let mut settings = options();
             settings.threads.max_threads = threads;
             let tree = scan_dir(temp.path(), &settings);
