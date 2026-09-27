@@ -5,10 +5,11 @@
 //! that panics while painting, a binding that never fires, a removal that
 //! reports success without removing anything.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use disktree_core::removal::RemovalMode;
 use disktree_core::scan::{ScanOptions, scan};
+use disktree_core::space::{SpaceInfo, Volume};
 use disktree_core::treemap::Tile;
 use gpui_kit::{
     Bounds, Context, Entity, Pixels, Point, TestAppContext, VisualTestContext,
@@ -464,6 +465,83 @@ fn the_help_overlay_opens_and_closes(cx: &mut TestAppContext) {
     assert!(read(&view, cx, |app| app.show_help));
     press(cx, "escape");
     assert!(!read(&view, cx, |app| app.show_help));
+}
+
+#[gpui_kit::test]
+fn the_volume_picker_opens_moves_and_closes(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    // The picker lists volumes and draws them without panicking; Escape
+    // leaves the scan where it was.
+    press(cx, "v");
+    assert!(read(&view, cx, |app| app.volumes_open));
+    draw(cx);
+    assert!(cx.debug_bounds("disktree-root").is_some());
+    let before = read(&view, cx, |app| app.root_path.clone());
+    press(cx, "down");
+    press(cx, "up");
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.volumes_open));
+    assert_eq!(read(&view, cx, |app| app.root_path.clone()), before);
+}
+
+#[gpui_kit::test]
+fn the_volume_picker_is_centred_and_still_dismisses_from_outside(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    // Fixed rows, so this is about where the popup lands and not about which
+    // disks the machine running the test happens to have.
+    update(&view, cx, |app, cx| {
+        app.volumes = vec![
+            Volume {
+                point: PathBuf::from("/one"),
+                device: Some("/dev/one".into()),
+                space: Some(SpaceInfo {
+                    total: 1_000,
+                    free: 500,
+                    available: 400,
+                }),
+            },
+            Volume {
+                point: PathBuf::from("/two"),
+                device: None,
+                space: None,
+            },
+        ];
+        app.volumes_open = true;
+        cx.notify();
+    });
+    draw(cx);
+
+    let viewport = cx.update(|window, _| window.viewport_size());
+    let rows = cx.debug_bounds("volume-rows").expect("the rows are drawn");
+    let centre = rows.center();
+    assert!(
+        (centre.x - viewport.width / 2.0).abs() < px(4.),
+        "the popup is not centred across: {centre:?} in {viewport:?}"
+    );
+    assert!(
+        (centre.y - viewport.height / 2.0).abs() < px(150.),
+        "the popup is not centred down: {centre:?} in {viewport:?}"
+    );
+
+    // The wrapper that centres the popup must not swallow the backdrop's
+    // clicks: a click in the corner, outside the popup, still closes it.
+    cx.simulate_click(
+        gpui_kit::point(px(4.), px(4.)),
+        gpui_kit::Modifiers::none(),
+    );
+    draw(cx);
+    assert!(
+        !read(&view, cx, |app| app.volumes_open),
+        "clicking outside the picker closes it"
+    );
 }
 
 #[gpui_kit::test]

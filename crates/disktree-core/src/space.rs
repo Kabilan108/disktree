@@ -329,6 +329,175 @@ pub const fn foreign_mounts_for(_root: &Path) -> Option<Vec<PathBuf>> {
     Some(Vec::new())
 }
 
+/// A mounted volume the picker can switch the scan to: where it is mounted
+/// and how much room it has. Listed by [`volumes`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Volume {
+    /// Where the volume is mounted: `C:\` on Windows, `/` or `/home` on
+    /// Linux, `/` on macOS.
+    pub point: PathBuf,
+    /// What is mounted there, when the table names it: a device such as
+    /// `/dev/nvme0n1p2`, or a name like `tmpfs`.
+    pub device: Option<String>,
+    /// Free space on the volume now; `None` when it cannot be read.
+    pub space: Option<SpaceInfo>,
+}
+
+impl Volume {
+    /// Free bytes for ranking; an unreadable volume sorts last.
+    const fn available(&self) -> u64 {
+        match &self.space {
+            Some(space) => space.available,
+            None => 0,
+        }
+    }
+}
+
+/// Every volume worth offering as a scan root, fullest first.
+///
+/// Pseudo filesystems (`/proc`, `/sys`, tmpfs, …), snapshot subvolumes and
+/// automount points are left out: switching the scan to one of those would
+/// measure the wrong thing, the same reason [`foreign_mounts`] keeps a scan
+/// from entering them. Duplicates from one device mounted twice (a btrfs
+/// subvolume at `/` and `/home`) collapse to the shortest mount point, which
+/// is the top of that disk.
+#[cfg(not(any(target_os = "macos", windows)))]
+pub fn volumes() -> Vec<Volume> {
+    let Ok(table) = std::fs::read_to_string("/proc/self/mounts") else {
+        return Vec::new();
+    };
+    volumes_in(&parse_mounts(&table))
+}
+
+/// [`volumes`] over a given mount table, for testing.
+pub fn volumes_in(mounts: &[Mount]) -> Vec<Volume> {
+    let mut seen: Vec<&Mount> = Vec::new();
+    for mount in mounts {
+        if !is_volume_candidate(mount) {
+            continue;
+        }
+        // One device mounted twice (a btrfs disk at `/`, `/home`,
+        // `/var/log`) is one volume: keep the shortest mount point, which is
+        // the top of that disk.
+        if let Some(known) = seen.iter_mut().find(|known| {
+            known.source == mount.source && known.fstype == mount.fstype
+        }) {
+            if mount.point.as_os_str().len() < known.point.as_os_str().len() {
+                *known = mount;
+            }
+            continue;
+        }
+        seen.push(mount);
+    }
+    let mut volumes: Vec<Volume> = seen
+        .iter()
+        .map(|mount| Volume {
+            point: mount.point.clone(),
+            device: Some(mount.source.clone()),
+            space: space_info(&mount.point).ok(),
+        })
+        .collect();
+    // The scarcest room is the most interesting to a cleanup tool, so the
+    // fullest volume that still reads is first; unreadable ones sort last.
+    sort_by_free_space(&mut volumes);
+    volumes
+}
+
+/// Fullest first; an unreadable volume sorts last.
+fn sort_by_free_space(volumes: &mut [Volume]) {
+    volumes.sort_by_key(|volume| std::cmp::Reverse(volume.available()));
+}
+
+/// Whether the mount is a real disk worth scanning: a device-backed
+/// filesystem that is not a snapshot, an automount point, or one of the
+/// pseudo filesystems the scan itself refuses to enter.
+fn is_volume_candidate(mount: &Mount) -> bool {
+    if is_snapshot(mount) {
+        return false;
+    }
+    if mount
+        .options
+        .split(',')
+        .any(|option| option == "automounted" || option.starts_with("autofs"))
+    {
+        return false;
+    }
+    !matches!(
+        mount.fstype.as_str(),
+        "autofs"
+            | "cgroup"
+            | "cgroup2"
+            | "configfs"
+            | "debugfs"
+            | "devpts"
+            | "devtmpfs"
+            | "fuse.portal"
+            | "fusectl"
+            | "hugetlbfs"
+            | "mqueue"
+            | "nsfs"
+            | "overlay"
+            | "proc"
+            | "pstore"
+            | "securityfs"
+            | "sysfs"
+            | "tmpfs"
+            | "tracefs"
+    )
+}
+
+/// Every volume worth offering as a scan root, fullest first.
+///
+/// The Data volume's second mount is the same disk under another name, so it
+/// is left out; the firmlinks joined into `/` mean `/` already shows it.
+#[cfg(target_os = "macos")]
+pub fn volumes() -> Vec<Volume> {
+    use std::process::Command;
+
+    let output = Command::new("mount")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok());
+    let Some(output) = output else {
+        return Vec::new();
+    };
+    let mut points = parse_macos_mounts(&output);
+    points.retain(|point| {
+        point.as_os_str() != MACOS_DATA_VOLUME && !point.as_os_str().is_empty()
+    });
+    let mut volumes: Vec<Volume> = points
+        .iter()
+        .map(|point| Volume {
+            point: point.clone(),
+            device: device_for(point),
+            space: space_info(point).ok(),
+        })
+        .collect();
+    sort_by_free_space(&mut volumes);
+    volumes
+}
+
+/// Every place a volume is mounted that can be scanned.
+///
+/// Drive roots such as `D:\` and folders a volume is mounted on. Unready
+/// drives (an empty card reader reports a path but no space) are left out,
+/// since there is nothing to measure there.
+#[cfg(windows)]
+pub fn volumes() -> Vec<Volume> {
+    let mut volumes: Vec<Volume> = crate::windows::mount_points()
+        .into_iter()
+        .filter_map(|point| {
+            space_info(&point).ok().map(|space| Volume {
+                point,
+                device: None,
+                space: Some(space),
+            })
+        })
+        .collect();
+    sort_by_free_space(&mut volumes);
+    volumes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,6 +533,33 @@ portal /run/user/1000/doc fuse.portal rw 0 0
         .map(PathBuf::from)
         .collect();
         assert_eq!(foreign, expected, "/home and /var/log are the same disk");
+    }
+
+    #[test]
+    fn volume_candidates_are_real_disks_not_pseudo_filesystems() {
+        let mounts = parse_mounts(OMARCHY);
+        let points: Vec<PathBuf> = volumes_in(&mounts)
+            .iter()
+            .map(|volume| volume.point.clone())
+            .collect();
+        // One btrfs disk (at `/`, collapsing `/home` and `/var/log`), plus
+        // the boot disk; tmpfs, autofs, portals and snapshots are not scans.
+        assert!(points.contains(&PathBuf::from("/")), "{points:?}");
+        assert!(points.contains(&PathBuf::from("/boot")), "{points:?}");
+        assert_eq!(points.len(), 2, "{points:?}");
+    }
+
+    #[test]
+    fn separate_home_disk_is_its_own_volume() {
+        let separate = parse_mounts(
+            "/dev/sda1 / ext4 rw 0 0\n/dev/sdb1 /home ext4 rw 0 0\n",
+        );
+        let points: Vec<PathBuf> = volumes_in(&separate)
+            .iter()
+            .map(|volume| volume.point.clone())
+            .collect();
+        assert!(points.contains(&PathBuf::from("/")), "{points:?}");
+        assert!(points.contains(&PathBuf::from("/home")), "{points:?}");
     }
 
     #[test]
