@@ -1012,6 +1012,8 @@ fn widening_reuses_the_tree_it_has_and_reads_only_the_rest(
     let (view, cx) = view_over(&inner, cx);
     update(&view, cx, |app, _| {
         app.disk_root = Some(temp.path().to_path_buf());
+        // Stale on purpose: the wider root, a folder, must reset it.
+        app.file_table = true;
     });
     let before = read(&view, cx, |app| app.tree().map(|tree| tree.files));
 
@@ -1039,6 +1041,10 @@ fn widening_reuses_the_tree_it_has_and_reads_only_the_rest(
     assert!(read(&view, cx, |app| app.tree().is_some()));
     finish_scan(&view, cx);
     assert_eq!(read(&view, cx, |app| app.root_path.clone()), temp.path());
+    assert!(
+        !read(&view, cx, |app| app.file_table),
+        "the offer follows the root it widened to"
+    );
     let (reused, rest, selected) = read(&view, cx, |app| {
         let tree = app.tree().expect("the wider tree");
         let junk = tree.child_named("junk").map(|node| node.files);
@@ -1484,4 +1490,46 @@ fn mouse_side_buttons_go_back_and_forward(cx: &mut TestAppContext) {
     press_button(cx, MouseButton::Navigate(NavigationDirection::Back));
     assert_eq!(read(&view, cx, |app| app.crumbs.clone()), deeper);
     assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
+}
+
+/// The restart as administrator reopens the same root and options: every
+/// flag it writes is one the command line reads back.
+#[test]
+fn restart_arguments_parse_back_to_the_same_scan() {
+    use disktree_core::tree::Metric;
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let root = temp.path().join("a folder");
+    std::fs::create_dir(&root).expect("mkdir");
+    let root = dunce::canonicalize(&root).expect("canonical root");
+    let changed = ScanOptions {
+        apparent_size: true,
+        follow_links: true,
+        include_hidden: false,
+        one_filesystem: false,
+        metric: Metric::Files,
+        ..ScanOptions::default()
+    };
+    for (options, depth) in [(changed, 5), (ScanOptions::default(), 1)] {
+        let args = crate::state::restart_args(&options, depth, &root);
+        let parsed = crate::parse_args(args.into_iter()).expect("parses");
+        assert_eq!(parsed.root, root);
+        assert_eq!(parsed.depth, depth);
+        let got = &parsed.options;
+        assert_eq!(
+            (
+                got.apparent_size,
+                got.follow_links,
+                got.include_hidden,
+                got.one_filesystem,
+                got.metric,
+            ),
+            (
+                options.apparent_size,
+                options.follow_links,
+                options.include_hidden,
+                options.one_filesystem,
+                options.metric,
+            )
+        );
+    }
 }

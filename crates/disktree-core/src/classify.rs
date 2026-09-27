@@ -11,6 +11,10 @@
 //! space is the same idea, plus a sibling check where a name alone is too
 //! common to trust: `target` is only a build directory beside a `Cargo.toml`.
 
+use std::borrow::Cow;
+
+use rayon::prelude::*;
+
 use crate::tree::Node;
 
 /// A kind of data, for colour.
@@ -105,15 +109,33 @@ impl Reclaim {
     }
 }
 
+/// Bytes of a name lowercased on the stack.
+const LOWERED: usize = 32;
+
+/// `name` lowercased, on the stack when it fits in [`LOWERED`] bytes: a
+/// directory on a whole disk is looked up twice for each of hundreds of
+/// thousands, and a string allocated each time was most of what
+/// classifying cost. A longer name is rare enough to allocate.
+fn lowered<'a>(name: &str, buffer: &'a mut [u8; LOWERED]) -> Cow<'a, str> {
+    let Some(bytes) = buffer.get_mut(..name.len()) else {
+        return Cow::Owned(name.to_ascii_lowercase());
+    };
+    bytes.copy_from_slice(name.as_bytes());
+    bytes.make_ascii_lowercase();
+    // ASCII lowercasing keeps UTF-8.
+    Cow::Borrowed(std::str::from_utf8(bytes).unwrap_or_default())
+}
+
 /// The kind a directory name announces on its own, if any.
 pub fn category_of_name(name: &str) -> Option<Category> {
-    let lower = name.to_ascii_lowercase();
+    let mut buffer = [0; LOWERED];
+    let lower = lowered(name, &mut buffer);
     // Windows: a work or school account's folder carries the organisation,
     // `OneDrive - Contoso`, and Dropbox's does the same, `Dropbox (Contoso)`.
     if lower.starts_with("onedrive - ") || lower.starts_with("dropbox (") {
         return Some(Category::Synced);
     }
-    let category = match lower.as_str() {
+    let category = match &*lower {
         "src" | "code" | "projects" | "repos" | "dev" | "work"
         | "workspace" | "workspaces" | "github.com" | "gitlab.com"
         | "sites" | "development" => Category::Code,
@@ -165,8 +187,9 @@ pub fn reclaim_of(
     parent: Category,
     has_sibling: impl Fn(&str) -> bool,
 ) -> Option<Reclaim> {
-    let lower = name.to_ascii_lowercase();
-    let reclaim = match lower.as_str() {
+    let mut buffer = [0; LOWERED];
+    let lower = lowered(name, &mut buffer);
+    let reclaim = match &*lower {
         ".cache" | "cache" | "caches" | ".ccache" | ".sccache" | "_cacache"
         // Windows' own caches in AppData\Local: npm's, NuGet's downloads,
         // the browser engine's, and compiled shaders, Direct3D's and the
@@ -206,14 +229,11 @@ pub fn reclaim_of(
 pub fn classify(root: &mut Node) {
     root.category = Category::Other;
     root.reclaim = None;
-    let children = std::mem::take(&mut root.children);
-    let names: Vec<Box<str>> =
-        children.iter().map(|child| child.name.clone()).collect();
-    root.children = children;
     for index in 0..root.children.len() {
+        let siblings = &root.children;
         let has_sibling =
-            |wanted: &str| names.iter().any(|name| &**name == wanted);
-        let child = &mut root.children[index];
+            |wanted: &str| siblings.iter().any(|name| &*name.name == wanted);
+        let child = &siblings[index];
         // A top-level directory with an unknown name takes the kind of its
         // largest recognisable child: `~/world` is mostly `.git`.
         let category = category_of_name(&child.name)
@@ -224,7 +244,7 @@ pub fn classify(root: &mut Node) {
             .is_dir()
             .then(|| reclaim_of(&child.name, Category::Other, has_sibling))
             .flatten();
-        classify_below(child, category, reclaim);
+        classify_below(&mut root.children[index], category, reclaim, 1);
     }
 }
 
@@ -232,35 +252,65 @@ fn classify_below(
     node: &mut Node,
     category: Category,
     reclaim: Option<Reclaim>,
+    depth: usize,
 ) {
     node.category = category;
     node.reclaim = reclaim;
-    if node.children.is_empty() {
+    // Most directories hold only files, which take this one's kind as
+    // they are: no list of kinds to build, no call per file.
+    if !node.children.iter().any(Node::is_dir) {
+        for child in &mut node.children {
+            child.category = category;
+            child.reclaim = reclaim;
+        }
         return;
     }
-    let names: Vec<Box<str>> = node
-        .children
-        .iter()
-        .map(|child| child.name.clone())
-        .collect();
-    for child in &mut node.children {
-        let has_sibling =
-            |wanted: &str| names.iter().any(|name| &**name == wanted);
-        let child_category = if child.is_dir() {
-            category_of_name(&child.name)
-                .or_else(|| is_git_store(child).then_some(Category::Git))
-                .unwrap_or(category)
-        } else {
-            category
-        };
-        let child_reclaim = reclaim.or_else(|| {
-            child
-                .is_dir()
-                .then(|| reclaim_of(&child.name, category, has_sibling))
-                .flatten()
-        });
-        classify_below(child, child_category, child_reclaim);
+    // See `tree::PARALLEL_LEVELS`: parallel only near the top. Deeper, the
+    // children are decided and descended one at a time, with no list of
+    // decisions: there are half a million directories to get through.
+    if depth < crate::tree::PARALLEL_LEVELS {
+        let kinds: Vec<(Category, Option<Reclaim>)> = (0..node.children.len())
+            .map(|index| kind_of(&node.children, index, category, reclaim))
+            .collect();
+        node.children.par_iter_mut().zip(kinds).for_each(
+            |(child, (category, reclaim))| {
+                classify_below(child, category, reclaim, depth + 1);
+            },
+        );
+    } else {
+        for index in 0..node.children.len() {
+            let (category, reclaim) =
+                kind_of(&node.children, index, category, reclaim);
+            classify_below(
+                &mut node.children[index],
+                category,
+                reclaim,
+                depth + 1,
+            );
+        }
     }
+}
+
+/// What the child at `index` is, given what its parent is: its own name
+/// wins, otherwise it inherits. A file always inherits.
+fn kind_of(
+    siblings: &[Node],
+    index: usize,
+    category: Category,
+    reclaim: Option<Reclaim>,
+) -> (Category, Option<Reclaim>) {
+    let child = &siblings[index];
+    if !child.is_dir() {
+        return (category, reclaim);
+    }
+    let has_sibling =
+        |wanted: &str| siblings.iter().any(|name| &*name.name == wanted);
+    let child_category = category_of_name(&child.name)
+        .or_else(|| is_git_store(child).then_some(Category::Git))
+        .unwrap_or(category);
+    let child_reclaim =
+        reclaim.or_else(|| reclaim_of(&child.name, category, has_sibling));
+    (child_category, child_reclaim)
 }
 
 /// The kind of an unknown directory, from what fills it: the first
@@ -540,7 +590,13 @@ mod tests {
             );
             assert_eq!(category_of_name(name), Some(Category::Cache), "{name}");
         }
-        for name in ["OneDrive - Contoso", "Dropbox (Contoso)", "iCloudDrive"] {
+        for name in [
+            "OneDrive - Contoso",
+            // Past the stack buffer for lowercasing.
+            "OneDrive - Contoso Pharmaceuticals International",
+            "Dropbox (Contoso)",
+            "iCloudDrive",
+        ] {
             assert_eq!(
                 category_of_name(name),
                 Some(Category::Synced),

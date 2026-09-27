@@ -10,6 +10,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use disktree_core::access::file_table_readable;
 use disktree_core::filter::{Keep, Matches, filter};
 use disktree_core::insights::{Candidate, worth_a_look};
 use disktree_core::removal::{
@@ -416,6 +417,15 @@ pub struct Disktree {
     /// Whether macOS lets this process read everything: asked once, since a
     /// grant only takes effect after a relaunch. `None` off macOS.
     pub full_disk_access: Option<bool>,
+    /// Whether disktree runs as an administrator, which lets a whole drive
+    /// be read from its file table instead of walked. `None` off Windows.
+    pub administrator: Option<bool>,
+    /// Whether the root is a whole NTFS drive, which an administrator reads
+    /// from its file table. Follows the root; `false` off Windows.
+    pub file_table: bool,
+    /// A restart as administrator was asked for and not yet declined, so a
+    /// second click does not raise a second prompt.
+    pub restarting: bool,
     /// The top of the disk the scanned root lives on: what "Whole disk"
     /// scans. Follows the root when a folder is opened.
     pub disk_root: Option<PathBuf>,
@@ -505,6 +515,9 @@ impl Disktree {
             git_pending: FxHashSet::default(),
             device: None,
             full_disk_access: None,
+            administrator: disktree_core::access::administrator(),
+            file_table: false,
+            restarting: false,
             disk_root: None,
             panel_rems: PANEL_REMS,
             scan_started: None,
@@ -520,6 +533,7 @@ impl Disktree {
         // The disk of what is on screen, as `set_root` keeps it: `disktree
         // /Volumes/Ext` then `g` measures that drive, like opening it with ⌘O.
         tree.disk_root = volume_root_for(&tree.root_path);
+        tree.file_table = file_table_readable(&tree.root_path);
         disktree_core::removal::prime_mount_points();
         tree.start_scan(cx);
         Self::start_space_ticker(cx);
@@ -562,6 +576,7 @@ impl Disktree {
         // can change: an external drive has its own.
         self.disk_root =
             volume_root_for(&root).or_else(|| self.disk_root.take());
+        self.file_table = file_table_readable(&root);
         self.root_path = root;
         self.screen = Screen::Explore;
         self.start_scan(cx);
@@ -692,7 +707,7 @@ impl Disktree {
         if !self.crumbs.is_empty() {
             self.remember();
         }
-        self.tree = None;
+        discard(self.tree.take());
         self.crumbs.clear();
         self.selected = None;
         self.hovered = None;
@@ -759,10 +774,11 @@ impl Disktree {
                     self.root_path.clone_from(&self.scan_root);
                     self.space = space_info(&self.root_path).ok();
                     self.device = device_for(&self.root_path);
+                    self.file_table = file_table_readable(&self.root_path);
                 }
                 let metric = self.options.metric;
                 self.marks.refresh(&self.root_path, &node, metric);
-                self.tree = Some(Arc::new(node));
+                discard(self.tree.replace(Arc::new(node)));
                 self.cache = None;
                 self.refresh_insights();
                 self.scan_elapsed =
@@ -1826,7 +1842,7 @@ impl Disktree {
         if let Some(tree) = &self.tree {
             let mut tree = (**tree).clone();
             disktree_core::tree::aggregate(&mut tree, self.options.metric);
-            self.tree = Some(Arc::new(tree));
+            discard(self.tree.replace(Arc::new(tree)));
             let metric = self.options.metric;
             self.marks.refresh(
                 &self.root_path,
@@ -1948,6 +1964,16 @@ impl Disktree {
         let plan = self.plan();
         if plan.is_empty() {
             self.notice = Some(("nothing is marked".into(), Status::Warning));
+            cx.notify();
+            return;
+        }
+        // This window quits once the prompt is answered yes, and quitting
+        // would stop a permanent delete halfway.
+        if self.restarting {
+            self.notice = Some((
+                "not while restarting as administrator".into(),
+                Status::Warning,
+            ));
             cx.notify();
             return;
         }
@@ -2763,6 +2789,80 @@ fn crumb_label(path: &Path) -> String {
     )
 }
 
+impl Disktree {
+    /// Start again as an administrator on the root this window is headed
+    /// for, with the same options, and close this window once the prompt is
+    /// accepted.
+    /// Declined, nothing changes. Not while a removal runs: quitting would
+    /// stop a permanent delete halfway.
+    pub fn restart_as_administrator(&mut self, cx: &mut Context<'_, Self>) {
+        if self.restarting || self.run.is_some() {
+            return;
+        }
+        self.restarting = true;
+        cx.notify();
+        // While a widening scan runs, the wider root is where this window
+        // ends up, and the drive the offer is about: reopening the folder
+        // still on screen would walk it again. `scan_root` equals
+        // `root_path` for any other scan, and is stale once none runs.
+        let root = if self.scan.is_some() {
+            &self.scan_root
+        } else {
+            &self.root_path
+        };
+        let args =
+            restart_args(&self.options, self.layout_options.max_depth, root);
+        // Off the UI thread: the prompt runs its own message loop, which
+        // would re-enter this window while it is still being handled.
+        let restart = cx.background_executor().spawn(async move {
+            disktree_core::access::restart_as_administrator(&args)
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = restart.await;
+            let _ = this.update(cx, |this, cx| match outcome {
+                Ok(()) => cx.quit(),
+                Err(error) => {
+                    this.restarting = false;
+                    this.notice = Some((
+                        format!("still not an administrator: {error}"),
+                        Status::Warning,
+                    ));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+}
+
+/// The command line that reopens `root` with `options` and `depth`, in the
+/// flags `parse_args` reads.
+pub fn restart_args(
+    options: &ScanOptions,
+    depth: u32,
+    root: &Path,
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    for (on, flag) in [
+        (options.apparent_size, "--apparent-size"),
+        (options.follow_links, "--follow-links"),
+        (!options.include_hidden, "--no-hidden"),
+        (!options.one_filesystem, "--cross-filesystems"),
+        (options.metric == Metric::Files, "--metric"),
+    ] {
+        if on {
+            args.push(flag.into());
+        }
+    }
+    if options.metric == Metric::Files {
+        args.push("files".into());
+    }
+    args.push("--depth".into());
+    args.push(depth.to_string().into());
+    args.push(root.as_os_str().to_owned());
+    args
+}
+
 /// Now, in Unix seconds.
 pub fn now_seconds() -> i64 {
     std::time::SystemTime::now()
@@ -2770,6 +2870,16 @@ pub fn now_seconds() -> i64 {
         .map_or(0, |since| {
             i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
         })
+}
+
+/// Let go of a tree off the UI thread: freeing a disk's millions of nodes
+/// takes a good part of a second, and nothing waits on it.
+fn discard(tree: Option<Arc<Node>>) {
+    if let Some(tree) = tree {
+        // When no thread can be made, the closure is dropped here instead,
+        // and the tree is freed in place rather than taking the window down.
+        let _ = std::thread::Builder::new().spawn(move || drop(tree));
+    }
 }
 
 /// Smallest tile, in rem, that gets a label: below this a name cannot be read.

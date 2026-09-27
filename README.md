@@ -288,14 +288,31 @@ The same program, with Windows' answers to the questions above:
   folder another volume is mounted on is a link, like a junction, and is
   not entered, so a scan stays on one volume; `-l` follows links, and with
   them mounted folders.
+- **Run as administrator** and the whole disk is read from NTFS's master
+  file table instead of walked, as WizTree does: one pass over the table in
+  large reads. On a 4-million-file `C:\` that took about 3.4 s against 11.2
+  s for WizTree and about 20 s for the walk. It also sees what the walk is
+  refused, such as System Volume Information. It is used only for a whole
+  NTFS drive, since a folder would still cost the whole table, and not with
+  `-l`, whose links the table does not follow. disktree flushes the volume
+  after its own removals so the rescan shows them; changes other programs
+  made seconds before may not show yet.
+  Started without admin rights, disktree walks as before. On a whole NTFS
+  drive without `-l`, or once Windows refuses the walk a folder, the side
+  panel offers **Restart as Administrator**, which reopens the same folder
+  and options through the UAC prompt; during a widening scan, the wider
+  folder being scanned.
 - **Move to trash** is the Recycle Bin, through the shell, which asks
   before destroying anything it cannot recycle.
 - **Refused besides the rules below:** Windows, Program Files and
   ProgramData, what Windows keeps at the top of its drive (System Volume
   Information, Recovery, Boot, and the page and hibernation files, which
-  Settings turns off), and any folder holding your profile, such as
-  `C:\Users`. Names compare without regard to case, as Windows compares
-  them.
+  Settings turns off), any folder holding your profile, such as
+  `C:\Users`, and every profile in the folder Windows keeps them in
+  (`C:\Users\*`, `Public` and `Default` included), since an elevated
+  disktree may run as another account and can reach them all. What is
+  inside a profile can still be removed, as under your own. Names compare
+  without regard to case, as Windows compares them.
 - **Hidden** means a name starting with a dot, or the hidden attribute, so
   `-H` drops `AppData` as Explorer hides it.
 - **The theme** follows Windows' light or dark setting, since there is no
