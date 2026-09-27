@@ -229,6 +229,8 @@ pub fn foreign_mounts_for(root: &Path) -> Option<Vec<PathBuf>> {
 /// mount from the filesystem itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MountView {
+    /// Kernel filesystem identity; source names such as `tmpfs` repeat.
+    pub device: String,
     pub source: String,
     pub fstype: String,
     pub point: PathBuf,
@@ -246,13 +248,15 @@ pub fn parse_mountinfo(table: &str) -> Vec<MountView> {
             // Optional fields run up to a lone `-`; after it come the type
             // and the source.
             let (left, right) = line.split_once(" - ")?;
-            let mut left = left.split_whitespace().skip(3);
+            let mut left = left.split_whitespace().skip(2);
+            let device = left.next()?.to_string();
             let fs_root = PathBuf::from(unescape_octal(left.next()?));
             let point = PathBuf::from(unescape_octal(left.next()?));
             let mut right = right.split_whitespace();
             let fstype = right.next()?.to_string();
             let source = unescape_octal(right.next()?);
             Some(MountView {
+                device,
                 source,
                 fstype,
                 point,
@@ -298,10 +302,40 @@ fn unescape_octal(field: &str) -> String {
 /// is left out. The scanned root itself is never left out; if it is the
 /// narrower view, its copy inside the wider one is.
 pub fn repeated_mounts(mounts: &[MountView], root: &Path) -> Vec<PathBuf> {
+    repeated_mounts_excluding(mounts, root, &[])
+}
+
+fn same_filesystem(left: &MountView, right: &MountView) -> bool {
+    left.fstype == right.fstype
+        && (left.device == right.device
+            // Btrfs assigns device numbers per subvolume. Its block device
+            // identifies the filesystem shared by those different roots.
+            || (left.fstype == "btrfs"
+                && left.source.starts_with("/dev/")
+                && left.source == right.source))
+}
+
+fn covering_mount<'a>(
+    mounts: &'a [MountView],
+    path: &Path,
+) -> Option<&'a MountView> {
+    mounts
+        .iter()
+        .filter(|mount| path.starts_with(&mount.point))
+        .max_by_key(|mount| mount.point.components().count())
+}
+
+fn repeated_mounts_excluding(
+    mounts: &[MountView],
+    root: &Path,
+    excluded: &[PathBuf],
+) -> Vec<PathBuf> {
+    let own = covering_mount(mounts, root);
     let mut visible: Vec<&MountView> = mounts
         .iter()
         .filter(|mount| {
-            mount.point.starts_with(root) || root.starts_with(&mount.point)
+            (mount.point.starts_with(root) || Some(*mount) == own)
+                && !excluded.iter().any(|skip| mount.point.starts_with(skip))
         })
         .collect();
     visible.sort_by_key(|mount| {
@@ -312,28 +346,49 @@ pub fn repeated_mounts(mounts: &[MountView], root: &Path) -> Vec<PathBuf> {
         )
     });
     let mut kept: Vec<&MountView> = Vec::new();
-    let mut repeated = Vec::new();
+    let mut repeated: Vec<PathBuf> = Vec::new();
     for mount in visible {
-        // Where this view's directory already appears through a kept one.
         let elsewhere = kept.iter().find_map(|wider| {
-            if wider.source != mount.source || wider.fstype != mount.fstype {
+            if !same_filesystem(wider, mount) {
                 return None;
             }
             let inside = mount.fs_root.strip_prefix(&wider.fs_root).ok()?;
             let path = wider.point.join(inside);
-            (path.starts_with(root) && path != mount.point).then_some(path)
-        });
-        match elsewhere {
-            Some(_) if mount.point != root && mount.point.starts_with(root) => {
-                repeated.push(mount.point.clone());
+            if !path.starts_with(root)
+                || path == mount.point
+                || excluded
+                    .iter()
+                    .chain(&repeated)
+                    .any(|skip| path.starts_with(skip))
+            {
+                return None;
             }
-            Some(copy) => {
-                if copy != root {
-                    repeated.push(copy);
-                }
+            // Another mount can hide the supposed original directory.
+            let covering = covering_mount(mounts, &path)?;
+            let relative = path.strip_prefix(&covering.point).ok()?;
+            (same_filesystem(covering, mount)
+                && covering.fs_root.join(relative) == mount.fs_root)
+                .then_some(path)
+        });
+        let skip = elsewhere.map(|copy| {
+            if mount.point != root && mount.point.starts_with(root) {
+                mount.point.clone()
+            } else {
+                copy
+            }
+        });
+        if let Some(skip) = skip
+            && !root.starts_with(&skip)
+            // A duplicate view can contain independently mounted data.
+            // Keep it rather than hiding that data with its parent.
+            && !mounts.iter().any(|child| child.point != skip && child.point.starts_with(&skip))
+        {
+            if skip != mount.point {
                 kept.push(mount);
             }
-            None => kept.push(mount),
+            repeated.push(skip);
+        } else {
+            kept.push(mount);
         }
     }
     repeated
@@ -341,11 +396,20 @@ pub fn repeated_mounts(mounts: &[MountView], root: &Path) -> Vec<PathBuf> {
 
 /// [`repeated_mounts`] for this machine, in `root`'s own spelling. Empty
 /// where there is no `/proc/self/mountinfo`.
-pub fn repeated_mounts_for(root: &Path, canonical: &Path) -> Vec<PathBuf> {
+pub fn repeated_mounts_for(
+    root: &Path,
+    canonical: &Path,
+    one_filesystem: bool,
+) -> Vec<PathBuf> {
     let Ok(table) = std::fs::read_to_string("/proc/self/mountinfo") else {
         return Vec::new();
     };
-    repeated_mounts(&parse_mountinfo(&table), canonical)
+    let excluded = if one_filesystem {
+        foreign_mounts_for(canonical).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    repeated_mounts_excluding(&parse_mountinfo(&table), canonical, &excluded)
         .iter()
         .filter_map(|path| path.strip_prefix(canonical).ok())
         .map(|below| root.join(below))
@@ -700,6 +764,56 @@ portal /run/user/1000/doc fuse.portal rw 0 0
                 PathBuf::from("/mnt/top/@"),
                 PathBuf::from("/var/log"),
             ]
+        );
+    }
+
+    #[test]
+    fn unrelated_tmpfs_mounts_are_not_duplicates() {
+        let table = "1 0 8:1 / / rw - ext4 /dev/root rw\n\
+                     2 1 0:20 / /one rw - tmpfs tmpfs rw\n\
+                     3 1 0:21 / /two rw - tmpfs tmpfs rw\n";
+        assert!(repeated(table, "/").is_empty());
+        let alias =
+            format!("{table}4 1 0:20 / /three rw - tmpfs different-name rw\n");
+        assert_eq!(repeated(&alias, "/"), [PathBuf::from("/three")]);
+    }
+
+    #[test]
+    fn hidden_original_and_nested_mounts_are_preserved() {
+        let hidden = "1 0 8:1 / / rw - ext4 /dev/root rw\n\
+                      2 1 0:20 / /data rw - tmpfs tmpfs rw\n\
+                      3 2 8:1 /data/source /data/bind rw - ext4 /dev/root rw\n";
+        assert!(repeated(hidden, "/").is_empty());
+        let nested = "1 0 8:1 / / rw - ext4 /dev/root rw\n\
+                      2 1 8:1 /original /view rw - ext4 /dev/root rw\n\
+                      3 2 0:20 / /view/unique rw - tmpfs tmpfs rw\n";
+        assert!(repeated(nested, "/").is_empty());
+    }
+
+    #[test]
+    fn excluded_views_cannot_replace_visible_files() {
+        let mounts = parse_mountinfo(
+            "1 0 8:1 / / rw - ext4 /dev/root rw\n\
+                                     2 1 8:1 /original /view rw - ext4 /dev/root rw\n",
+        );
+        assert!(
+            repeated_mounts_excluding(
+                &mounts,
+                Path::new("/"),
+                &[PathBuf::from("/original")]
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn btrfs_subvolume_devices_can_differ() {
+        let table = "1 0 0:20 /@ / rw - btrfs /dev/root rw\n\
+                     2 1 0:21 /@home /home rw - btrfs /dev/root rw\n\
+                     3 1 0:22 / /top rw - btrfs /dev/root rw\n";
+        assert_eq!(
+            repeated(table, "/"),
+            [PathBuf::from("/home"), PathBuf::from("/top/@")]
         );
     }
 

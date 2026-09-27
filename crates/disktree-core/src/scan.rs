@@ -750,10 +750,18 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
             format!("{} is not a directory", root.display()),
         ));
     }
-let resolved = root.canonicalize().ok();
+    let resolved = root.canonicalize().ok();
     let canonical = resolved.as_deref().unwrap_or(root);
-    let mut never = space::never_scanned(root, canonical);
-    never.extend(space::repeated_mounts_for(root, canonical));
+    let mut never = crate::space::never_scanned(root, canonical);
+    // Hidden-entry and depth filters can leave an alias as the only route
+    // to files. Keep every mount view when either filter is active.
+    if context.options.include_hidden && context.options.max_depth.is_none() {
+        never.extend(crate::space::repeated_mounts_for(
+            root,
+            canonical,
+            context.options.one_filesystem,
+        ));
+    }
     let _ = context.never_scanned.set(never.into_iter().collect());
     if context.options.one_filesystem {
         *lock(&context.root_device) = Some(device_of(&root_meta));
