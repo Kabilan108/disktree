@@ -769,6 +769,32 @@ impl PendingDir {
 }
 
 fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
+    let owned = fixed_pool(context.options.threads)?;
+    let pool = owned.as_ref().unwrap_or_else(|| &WALK_POOL);
+    scan_on_pool(root, context, pool)
+}
+
+/// Explicit fixed budgets cover enumeration, the Windows file-table path and
+/// tree finishing. A scan owns its pool so a new setting needs no global reset.
+/// Default core callers and experimental adaptive scans retain the shared pool.
+fn fixed_pool(threads: ScanThreads) -> io::Result<Option<rayon::ThreadPool>> {
+    if threads.adaptive || threads.max_threads == usize::MAX {
+        return Ok(None);
+    }
+    let cpus = thread::available_parallelism().map_or(1, usize::from);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads.max_threads.clamp(1, cpus))
+        .thread_name(|index| format!("disktree-scan-{index}"))
+        .build()
+        .map(Some)
+        .map_err(io::Error::other)
+}
+
+fn scan_on_pool(
+    root: &Path,
+    context: &Arc<WalkContext>,
+    pool: &rayon::ThreadPool,
+) -> io::Result<Node> {
     let root_meta = fs::metadata(root)?;
     if !root_meta.is_dir() {
         return Err(io::Error::new(
@@ -800,7 +826,7 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
     #[cfg(windows)]
     {
         let progress = &context.progress;
-        let read = WALK_POOL.install(|| {
+        let read = pool.install(|| {
             crate::mft::scan(root, canonical, &context.options, progress)
         });
         if let Some(node) = read {
@@ -810,7 +836,7 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
             if progress.is_cancelled() {
                 return Err(crate::mft::cancelled());
             }
-            let node = finish_tree(node, &context.options);
+            let node = finish_tree(node, &context.options, pool);
             // The reader counted every file on the volume; the tree may
             // hold fewer.
             progress.settle(node.files, node.dirs, node.bytes);
@@ -842,7 +868,7 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
         0,
     ));
     let context: &WalkContext = context;
-    WALK_POOL.install(|| {
+    pool.install(|| {
         let mut threads = context.options.threads.normalized();
         threads.max_threads =
             threads.max_threads.min(rayon::current_num_threads());
@@ -887,7 +913,7 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
     let node = node.ok_or_else(|| {
         io::Error::other(format!("{} produced no tree", root.display()))
     })?;
-    Ok(finish_tree(node, &context.options))
+    Ok(finish_tree(node, &context.options, pool))
 }
 
 /// The walk's workers, and the file table reader's. Listing directories
@@ -1093,8 +1119,12 @@ fn signal_done(dir: &Arc<PendingDir>, context: &WalkContext) {
 /// Charge a hardlinked file once, derive every aggregate from the result,
 /// then classify. On the walk's pool: the UI's own work on the global pool
 /// must not queue behind a scan finishing.
-fn finish_tree(mut node: Node, options: &ScanOptions) -> Node {
-    WALK_POOL.install(|| {
+fn finish_tree(
+    mut node: Node,
+    options: &ScanOptions,
+    pool: &rayon::ThreadPool,
+) -> Node {
+    pool.install(|| {
         if options.dedup_hardlinks {
             aggregate_deduped(&mut node, options.metric, &Seen::new());
         } else {
@@ -1302,7 +1332,40 @@ mod tests {
     }
 
     #[test]
-    fn fixed_admission_preserves_a_wide_deep_tree() {
+    fn fixed_worker_pools_change_size_without_reinitializing_rayon() {
+        let cpus = thread::available_parallelism().map_or(1, usize::from);
+        // Two live pools have independent limits; constructing the first must
+        // not freeze the choice for a later scan or the global UI pool.
+        let make = |count| {
+            fixed_pool(ScanThreads {
+                max_threads: count,
+                ..ScanThreads::default()
+            })
+            .expect("pool")
+            .expect("explicit fixed pool")
+        };
+        let small = make(1);
+        let large = make(4);
+        assert_eq!(small.install(rayon::current_num_threads), 1);
+        assert_eq!(large.install(rayon::current_num_threads), 4.min(cpus));
+        assert!(
+            fixed_pool(ScanThreads::default())
+                .expect("default")
+                .is_none()
+        );
+        assert!(
+            fixed_pool(ScanThreads {
+                adaptive: true,
+                max_threads: 4,
+                ..ScanThreads::default()
+            })
+            .expect("adaptive")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn fixed_worker_pools_preserve_a_wide_deep_tree() {
         let temp = TempDir::new().expect("tempdir");
         for index in 0..96 {
             write(temp.path(), &format!("d{index}/nested/file"), index + 1);

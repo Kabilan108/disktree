@@ -969,15 +969,114 @@ fn view_settings(
 
     div()
         .flex()
-        .flex_row()
-        .items_center()
-        .gap(space::SM)
+        .flex_col()
+        .items_end()
+        .gap(space::XS)
         .flex_shrink_0()
-        .child(history)
-        .child(mode)
-        .child(hidden)
-        .child(apparent)
-        .child(depth_control)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(space::SM)
+                .child(history)
+                .child(mode)
+                .child(hidden)
+                .child(apparent)
+                .child(depth_control),
+        )
+        .child(power_efficiency(app, cx))
+}
+
+/// Keep the four labeled choices in a popup so even the smallest window can
+/// show the controls. Like the other settings, focus returns to the treemap.
+fn power_efficiency(app: &Disktree, cx: &Context<'_, Disktree>) -> Div {
+    let label = app.power_choice.map_or_else(
+        || "Custom".to_owned(),
+        |preset| preset.label(app.cpu_threads),
+    );
+    let mut control = div().relative().child(
+        div()
+            .id("power-efficiency")
+            .debug_selector(|| "power-efficiency".into())
+            .child(
+                button(
+                    "power-toggle",
+                    format!("Power Efficiency: {label}"),
+                    ButtonVariant::Secondary,
+                    cx,
+                )
+                .tab_stop(false)
+                .on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.power_menu_open = !this.power_menu_open;
+                        window.focus(&this.focus, cx);
+                        cx.notify();
+                    },
+                )),
+            ),
+    );
+    if app.power_menu_open {
+        let theme = cx.omarchy().clone();
+        let mut menu = div()
+            .id("power-menu")
+            .debug_selector(|| "power-menu".into())
+            .occlude()
+            .flex()
+            .flex_col()
+            .w(size::SIBLING_MENU)
+            .p(space::SM)
+            .gap(space::XS)
+            .bg(theme.surface)
+            .border_1()
+            .border_color(theme.control_border())
+            .shadow_lg()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.power_menu_open = false;
+                cx.notify();
+            }));
+        for preset in crate::power::PowerEfficiency::ALL {
+            let variant = if app.power_choice == Some(preset) {
+                ButtonVariant::Primary
+            } else {
+                ButtonVariant::Secondary
+            };
+            menu = menu.child(
+                div()
+                    .id(preset.key())
+                    .debug_selector(move || preset.key().into())
+                    .child(
+                        button(
+                            preset.key(),
+                            preset.label(app.cpu_threads),
+                            variant,
+                            cx,
+                        )
+                        .w_full()
+                        .tab_stop(false)
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.set_power_efficiency(preset, cx);
+                                window.focus(&this.focus, cx);
+                            },
+                        )),
+                    ),
+            );
+        }
+        menu = menu.child(div().text_size(text::CAPTION)
+            .text_color(theme.secondary)
+            .child("Saved for the next scan. Limits scan workers, not whole-app CPU or battery use."));
+        control = control.child(
+            div().absolute().top_full().right_0().child(
+                deferred(
+                    anchored()
+                        .snap_to_window_with_margin(px(space::SM.0 * app.rem))
+                        .child(menu),
+                )
+                .with_priority(2),
+            ),
+        );
+    }
+    control
 }
 
 // ── trail and legend ────────────────────────────────────────────────────

@@ -6,7 +6,9 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 /// A scan crossing several volumes shares this budget; separate scans do not.
 #[derive(Clone, Copy, Debug)]
 pub struct ScanThreads {
-    /// Maximum admitted directory jobs, including jobs awaiting a Rayon worker.
+    /// Fixed scan workers, capped by available CPUs; `usize::MAX` uses the
+    /// shared platform-default pool. With `adaptive`, maximum admitted directory
+    /// jobs instead, including jobs awaiting a Rayon worker.
     pub max_threads: usize,
     /// Search below the cap and respond to whole-system CPU pressure.
     pub adaptive: bool,
@@ -19,10 +21,10 @@ pub struct ScanThreads {
 impl Default for ScanThreads {
     fn default() -> Self {
         Self {
-            // Preserve core callers' pool-sized fixed concurrency. The macOS
-            // application explicitly selects its measured adaptive budget.
+            // Preserve core callers' pool-sized fixed concurrency. The app
+            // supplies the user's Power Efficiency preset before scanning.
             max_threads: usize::MAX,
-            // Core callers opt in; the application selects adaptive admission.
+            // Adaptive admission remains an explicit experimental opt-in.
             adaptive: false,
             retained_throughput: 0.80,
             system_cpu_limit: Some(0.80),

@@ -1614,6 +1614,12 @@ fn restart_arguments_parse_back_to_the_same_scan() {
         include_hidden: false,
         one_filesystem: false,
         metric: Metric::Files,
+        threads: disktree_core::scan_threads::ScanThreads {
+            max_threads: 8,
+            adaptive: true,
+            retained_throughput: 0.85,
+            system_cpu_limit: Some(0.70),
+        },
         ..ScanOptions::default()
     };
     for (options, depth) in [(changed, 5), (ScanOptions::default(), 1)] {
@@ -1622,6 +1628,18 @@ fn restart_arguments_parse_back_to_the_same_scan() {
         assert_eq!(parsed.root, root);
         assert_eq!(parsed.depth, depth);
         let got = &parsed.options;
+        assert_eq!(got.threads.max_threads, options.threads.max_threads);
+        assert_eq!(got.threads.adaptive, options.threads.adaptive);
+        assert!(
+            (got.threads.retained_throughput
+                - options.threads.retained_throughput)
+                .abs()
+                < f64::EPSILON
+        );
+        assert_eq!(
+            got.threads.system_cpu_limit,
+            options.threads.system_cpu_limit
+        );
         assert_eq!(
             (
                 got.apparent_size,
@@ -1639,4 +1657,55 @@ fn restart_arguments_parse_back_to_the_same_scan() {
             )
         );
     }
+}
+
+#[gpui_kit::test]
+fn power_efficiency_menu_saves_without_discarding_the_tree(
+    cx: &mut TestAppContext,
+) {
+    use crate::power::{self, PowerEfficiency as Power};
+    use gpui_kit::Modifiers;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let config = tempfile::tempdir().expect("config");
+    let path = config.path().join("power-efficiency");
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(900.), px(600.)));
+    update(&view, cx, |app, _| {
+        app.power_settings_path = Some(path.clone());
+    });
+    let epoch = read(&view, cx, |app| app.scan_epoch);
+    for preset in Power::ALL {
+        draw(cx);
+        let button = cx.debug_bounds("power-efficiency").expect("control");
+        cx.simulate_click(button.center(), Modifiers::none());
+        draw(cx);
+        let choice = cx.debug_bounds(preset.key()).expect("preset");
+        cx.simulate_click(choice.center(), Modifiers::none());
+        draw(cx);
+        assert_eq!(power::load(&path).expect("saved"), preset);
+        read(&view, cx, |app| {
+            assert_eq!(app.power_choice, Some(preset));
+            assert_eq!(
+                app.options.threads.max_threads,
+                preset.threads(app.cpu_threads)
+            );
+            assert!(!app.options.threads.adaptive);
+            assert!(!app.power_menu_open);
+            assert_eq!(app.scan_epoch, epoch);
+            assert!(app.tree.is_some());
+        });
+    }
+    // Persistence failure must not masquerade as a saved preference.
+    update(&view, cx, |app, cx| {
+        app.power_settings_path = Some(config.path().to_owned());
+        app.set_power_efficiency(Power::Miser, cx);
+    });
+    assert!(read(&view, cx, |app| app
+        .notice
+        .as_ref()
+        .is_some_and(|(message, _)| message.contains("could not save"))));
+    update(&view, cx, Disktree::start_scan);
+    assert_eq!(read(&view, cx, |app| app.scan_epoch), epoch + 1);
 }

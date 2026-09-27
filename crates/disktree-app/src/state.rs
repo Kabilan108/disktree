@@ -327,6 +327,10 @@ pub struct Disktree {
     pub root_path: PathBuf,
     pub home: Option<PathBuf>,
     pub options: ScanOptions,
+    pub power_choice: Option<crate::power::PowerEfficiency>,
+    pub power_settings_path: Option<PathBuf>,
+    pub power_menu_open: bool,
+    pub cpu_threads: usize,
     pub tree: Option<Arc<Node>>,
     pub scan: Option<ScanHandle>,
     pub scan_epoch: u64,
@@ -462,6 +466,10 @@ impl Disktree {
             root_path,
             home,
             options,
+            power_choice: None,
+            power_settings_path: crate::power::settings_path(),
+            power_menu_open: false,
+            cpu_threads: crate::power::cpu_threads(),
             tree: None,
             scan: None,
             scan_epoch: 0,
@@ -796,6 +804,35 @@ impl Disktree {
         self.progress = scan.progress.snapshot();
         self.scan_elapsed = self.scan_started.map(|started| started.elapsed());
         self.scan_root.clone_from(&self.root_path);
+        cx.notify();
+    }
+
+    /// Changing resource policy leaves the current scan and result intact;
+    /// rescan, navigation to a new root and restart use the new fixed budget.
+    pub fn set_power_efficiency(
+        &mut self,
+        preset: crate::power::PowerEfficiency,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.options.threads = preset.policy(self.cpu_threads);
+        self.power_choice = Some(preset);
+        self.power_menu_open = false;
+        self.notice = Some(match self.power_settings_path.as_deref() {
+            Some(path) => match crate::power::save(path, preset) {
+                Ok(()) => (
+                    format!("{} saved; applies to the next scan", preset.label(self.cpu_threads)),
+                    Status::Success,
+                ),
+                Err(error) => (
+                    format!("Applies to the next scan, but could not save Power Efficiency: {error}"),
+                    Status::Warning,
+                ),
+            },
+            None => (
+                "Power Efficiency applies to the next scan; no settings directory is available".into(),
+                Status::Warning,
+            ),
+        });
         cx.notify();
     }
 
@@ -2935,8 +2972,11 @@ impl Disktree {
         } else {
             &self.root_path
         };
-        let args =
+        let mut args =
             restart_args(&self.options, self.layout_options.max_depth, root);
+        if let Some(preset) = self.power_choice {
+            args.extend(["--power-efficiency".into(), preset.key().into()]);
+        }
         // Off the UI thread: the prompt runs its own message loop, which
         // would re-enter this window while it is still being handled.
         let restart = cx.background_executor().spawn(async move {
@@ -2982,6 +3022,25 @@ pub fn restart_args(
     if options.metric == Metric::Files {
         args.push("files".into());
     }
+    args.push("--scan-threads".into());
+    args.push(options.threads.max_threads.to_string().into());
+    args.push(if options.threads.adaptive {
+        "--adaptive-threads".into()
+    } else {
+        "--fixed-threads".into()
+    });
+    args.push("--thread-throughput-percent".into());
+    args.push(
+        format!("{:.0}", options.threads.retained_throughput * 100.0).into(),
+    );
+    args.push("--thread-system-cpu-percent".into());
+    args.push(
+        format!(
+            "{:.0}",
+            options.threads.system_cpu_limit.unwrap_or(0.0) * 100.0
+        )
+        .into(),
+    );
     args.push("--depth".into());
     args.push(depth.to_string().into());
     args.push(root.as_os_str().to_owned());

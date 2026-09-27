@@ -16,6 +16,7 @@ mod appearance;
 mod git;
 mod marks;
 mod palette;
+mod power;
 mod state;
 #[cfg(test)]
 mod tests;
@@ -43,6 +44,7 @@ struct Args {
     root: PathBuf,
     options: ScanOptions,
     depth: u32,
+    power: Option<power::PowerEfficiency>,
 }
 
 const USAGE: &str = "\
@@ -65,7 +67,11 @@ options:
                         also measure other disks, network shares and pseudo
                         filesystems mounted below PATH (off by default)
   -d, --depth N         how many levels to draw at once (1-6, default 3)
-      --scan-threads N  maximum directory jobs per scan (macOS default 8)
+      --power-efficiency PRESET
+                        miser, balanced (default), aggressive, drain-my-battery
+      --scan-threads N  fixed scan workers, capped by available CPU count
+      --adaptive-threads
+                        experimental adaptive admission (opt-in)
       --fixed-threads   disable adaptive admission and CPU governor
       --thread-throughput-percent N
                         retain this percent of sampled initial throughput (80)
@@ -85,7 +91,16 @@ fn main() -> Result<()> {
 }
 
 fn run() -> Result<()> {
-    let args = parse_args(std::env::args_os().skip(1))?;
+    let saved = power::settings_path()
+        .map_or_else(
+            || Ok(power::PowerEfficiency::default()),
+            |path| power::load(&path),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("Cannot load Power Efficiency: {error}; using Balanced");
+            power::PowerEfficiency::default()
+        });
+    let args = parse_args_with_power(std::env::args_os().skip(1), saved)?;
 
     // When the app executable is reached through the command-line symlink,
     // cmux sends SIGTERM to its foreground process group as AppKit takes
@@ -164,12 +179,14 @@ fn run() -> Result<()> {
                             appearance::follow(window);
                         }
                         cx.new(|cx| {
-                            Disktree::new(
+                            let mut app = Disktree::new(
                                 root_for_app.clone(),
                                 options.clone(),
                                 depth,
                                 cx,
-                            )
+                            );
+                            app.power_choice = args.power;
+                            app
                         })
                     },
                 )
@@ -187,15 +204,21 @@ fn run() -> Result<()> {
 }
 
 /// Read the command line, program name already skipped.
-fn parse_args(
+#[cfg(test)]
+fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Args> {
+    parse_args_with_power(args, power::PowerEfficiency::default())
+}
+
+fn parse_args_with_power(
     mut args: impl Iterator<Item = std::ffi::OsString>,
+    preset: power::PowerEfficiency,
 ) -> Result<Args> {
     let mut root: Option<PathBuf> = None;
-    let mut options = ScanOptions::default();
-    if cfg!(target_os = "macos") {
-        options.threads.max_threads = 8;
-        options.threads.adaptive = true;
-    }
+    let mut options = ScanOptions {
+        threads: preset.policy(power::cpu_threads()),
+        ..ScanOptions::default()
+    };
+    let mut power = Some(preset);
     let mut depth = 3_u32;
     let mut disk = false;
     // `std::env::args` panics on a name that is not Unicode, and a path is
@@ -229,7 +252,16 @@ fn parse_args(
                     "--depth must be 1 to 6"
                 );
             }
+            "--power-efficiency" => {
+                let value =
+                    text(args.next(), "--power-efficiency needs a preset")?;
+                let preset = power::PowerEfficiency::parse(&value)
+                    .context("unknown Power Efficiency preset")?;
+                options.threads = preset.policy(power::cpu_threads());
+                power = Some(preset);
+            }
             "--scan-threads" => {
+                power = None;
                 let value = text(args.next(), "--scan-threads needs a number")?;
                 options.threads.max_threads = value
                     .parse()
@@ -239,7 +271,15 @@ fn parse_args(
                     "--scan-threads must be positive"
                 );
             }
-            "--fixed-threads" => options.threads.adaptive = false,
+            "--fixed-threads" => {
+                options.threads.adaptive = false;
+                power = None;
+            }
+            "--adaptive-threads" => {
+                options.threads.adaptive = true;
+                options.threads.system_cpu_limit = Some(0.80);
+                power = None;
+            }
             "--thread-throughput-percent" => {
                 let value = text(
                     args.next(),
@@ -316,6 +356,7 @@ fn parse_args(
         root,
         options,
         depth: depth.clamp(1, 6),
+        power,
     })
 }
 
@@ -368,13 +409,9 @@ mod argument_tests {
         let args = parse_args(arguments(&[])).expect("defaults");
         assert_eq!(
             args.options.threads.max_threads,
-            if cfg!(target_os = "macos") {
-                8
-            } else {
-                usize::MAX
-            }
+            4.min(power::cpu_threads())
         );
-        assert_eq!(args.options.threads.adaptive, cfg!(target_os = "macos"));
+        assert!(!args.options.threads.adaptive);
         let args = parse_args(arguments(&[
             "--scan-threads",
             "4",
@@ -392,6 +429,40 @@ mod argument_tests {
                 < f64::EPSILON
         );
         assert_eq!(args.options.threads.system_cpu_limit, None);
+    }
+
+    #[test]
+    fn saved_power_is_loaded_before_cli_overrides() {
+        use power::PowerEfficiency as Power;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("power-efficiency");
+        power::save(&path, Power::Miser).expect("save");
+        let saved = power::load(&path).expect("load");
+        let args = parse_args_with_power(arguments(&[]), saved).expect("saved");
+        assert_eq!(args.power, Some(Power::Miser));
+        assert_eq!(
+            args.options.threads.max_threads,
+            2.min(power::cpu_threads())
+        );
+        let args = parse_args_with_power(
+            arguments(&["--power-efficiency", "drain-my-battery"]),
+            saved,
+        )
+        .expect("override");
+        assert_eq!(args.power, Some(Power::DrainMyBattery));
+        assert_eq!(args.options.threads.max_threads, power::cpu_threads());
+        let args = parse_args_with_power(
+            arguments(&["--scan-threads", "8", "--adaptive-threads"]),
+            saved,
+        )
+        .expect("experiment");
+        assert!(args.power.is_none());
+        assert!(args.options.threads.adaptive);
+        assert_eq!(args.options.threads.max_threads, 8);
+        assert_eq!(power::load(&path).expect("unchanged"), saved);
+        assert!(
+            parse_args(arguments(&["--power-efficiency", "invalid"])).is_err()
+        );
     }
 
     // APFS rejects these filename bytes; Linux filesystems permit them.
