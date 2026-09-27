@@ -28,6 +28,7 @@ use std::thread;
 use rayon::Scope;
 use rustc_hash::FxHashSet;
 
+use crate::scan_threads::{Admission, ControllerGuard, ScanThreads};
 use crate::tree::{Metric, Node, NodeKind, aggregate};
 
 /// Errors kept verbatim before the list is truncated; the count keeps rising.
@@ -59,6 +60,8 @@ pub struct ScanOptions {
     pub dedup_hardlinks: bool,
     /// Whether children are ranked by bytes or by file count.
     pub metric: Metric,
+    /// Directory admission for this scan; other scans have their own budget.
+    pub threads: ScanThreads,
 }
 
 impl Default for ScanOptions {
@@ -71,6 +74,7 @@ impl Default for ScanOptions {
             max_depth: None,
             dedup_hardlinks: true,
             metric: Metric::Bytes,
+            threads: ScanThreads::default(),
         }
     }
 }
@@ -89,6 +93,11 @@ pub struct ScanProgress {
     finished: AtomicBool,
     cancelled: AtomicBool,
     messages: Mutex<Vec<String>>,
+    pub(crate) threads: AtomicUsize,
+    pub(crate) threads_settled: AtomicBool,
+    pub(crate) thread_tuning_complete: AtomicBool,
+    pub(crate) system_cpu_limited: AtomicBool,
+    pub(crate) worker_transitions: AtomicU64,
 }
 
 /// A point-in-time view of [`ScanProgress`].
@@ -100,11 +109,21 @@ pub struct ScanSnapshot {
     pub errors: u64,
     pub finished: bool,
     pub cancelled: bool,
+    /// Admitted directory jobs, not a machine-wide thread limit.
+    pub threads: usize,
+    pub threads_settled: bool,
+    pub thread_tuning_complete: bool,
+    pub system_cpu_limited: bool,
+    pub worker_transitions: u64,
     /// Up to [`MAX_ERROR_DETAIL`] unreadable paths, most recent last.
     pub messages: Vec<String>,
 }
 
 impl ScanProgress {
+    pub(crate) fn entries(&self) -> u64 {
+        self.files.load(Ordering::Relaxed) + self.dirs.load(Ordering::Relaxed)
+    }
+
     fn count_file(&self, bytes: u64) {
         self.files.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
@@ -147,6 +166,13 @@ impl ScanProgress {
             errors: self.errors.load(Ordering::Relaxed),
             finished: self.finished.load(Ordering::Relaxed),
             cancelled: self.is_cancelled(),
+            threads: self.threads.load(Ordering::Relaxed),
+            threads_settled: self.threads_settled.load(Ordering::Relaxed),
+            thread_tuning_complete: self
+                .thread_tuning_complete
+                .load(Ordering::Relaxed),
+            system_cpu_limited: self.system_cpu_limited.load(Ordering::Relaxed),
+            worker_transitions: self.worker_transitions.load(Ordering::Relaxed),
             messages: lock(&self.messages).clone(),
         }
     }
@@ -698,7 +724,33 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
     }
 
     let root_dir = Arc::new(PendingDir::new(root.to_path_buf(), None, 0));
-    rayon::scope(|scope| walk(scope, &root_dir, context));
+    let mut threads = context.options.threads.normalized();
+    threads.max_threads = threads.max_threads.min(rayon::current_num_threads());
+    let admission = Arc::new(Admission::new(root_dir, threads.max_threads));
+    context
+        .progress
+        .threads
+        .store(threads.max_threads, Ordering::Relaxed);
+    context
+        .progress
+        .threads_settled
+        .store(true, Ordering::Relaxed);
+    context
+        .progress
+        .thread_tuning_complete
+        .store(!threads.adaptive, Ordering::Relaxed);
+    {
+        // The controller owns no Rayon worker and is joined before finishing
+        // the tree, where entry throughput no longer describes useful work.
+        let _controller = ControllerGuard::spawn(
+            threads,
+            Arc::clone(&admission),
+            Arc::clone(&context.progress),
+        )?;
+        rayon::scope(|scope| {
+            dispatch(scope, admission.start(), context, &admission);
+        });
+    }
 
     let node = lock(&context.root).take();
     let node = node.ok_or_else(|| {
@@ -710,7 +762,39 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
 /// Read one directory, spawn a task per subdirectory, then report completion.
 ///
 /// Flat tasks inside the scope: the worker stack never grows with tree depth.
-fn walk(scope: &Scope<'_>, dir: &Arc<PendingDir>, context: &Arc<WalkContext>) {
+fn dispatch(
+    scope: &Scope<'_>,
+    jobs: Vec<Arc<PendingDir>>,
+    context: &Arc<WalkContext>,
+    admission: &Arc<Admission<Arc<PendingDir>>>,
+) {
+    for dir in jobs {
+        let context = Arc::clone(context);
+        let admission = Arc::clone(admission);
+        scope.spawn(move |scope| {
+            let mut next = Some(dir);
+            while let Some(dir) = next.take() {
+                let children = walk(&dir, &context);
+                let mut jobs = admission.complete(children);
+                // Continue locally into one ready descendant; only surplus
+                // jobs are offered to other workers. A running directory is
+                // never split, and a retirement returns from this loop.
+                next = jobs.pop();
+                dispatch(scope, jobs, &context, &admission);
+            }
+        });
+    }
+}
+
+fn walk(
+    dir: &Arc<PendingDir>,
+    context: &Arc<WalkContext>,
+) -> Vec<Arc<PendingDir>> {
+    if context.cancelled() {
+        // Queued jobs still own a pending token even when no I/O is needed.
+        signal_done(dir, context);
+        return Vec::new();
+    }
     let mut subdirs: Vec<Arc<PendingDir>> = Vec::new();
     let mut leaves: Vec<Node> = Vec::new();
 
@@ -751,20 +835,20 @@ fn walk(scope: &Scope<'_>, dir: &Arc<PendingDir>, context: &Arc<WalkContext>) {
         .options
         .max_depth
         .is_none_or(|max_depth| dir.depth < max_depth);
+    let mut children = Vec::new();
     if descend {
         for subdir in subdirs {
             if context.cancelled() {
                 break;
             }
             dir.pending.fetch_add(1, Ordering::AcqRel);
-            let subdir = Arc::clone(&subdir);
-            let context = Arc::clone(context);
-            scope.spawn(move |scope| walk(scope, &subdir, &context));
+            children.push(subdir);
         }
     }
     lock(&dir.children).extend(leaves);
 
-    signal_done(&Arc::clone(dir), context);
+    signal_done(dir, context);
+    children
 }
 
 /// Report that one task for `dir` is done: either its own scan, or one of its
@@ -1007,6 +1091,53 @@ mod tests {
             .unwrap_or_else(|| {
                 panic!("no child named {name} in {:?}", node.name)
             })
+    }
+
+    #[test]
+    fn fixed_admission_preserves_a_wide_deep_tree() {
+        let temp = TempDir::new().expect("tempdir");
+        for index in 0..96 {
+            write(temp.path(), &format!("d{index}/nested/file"), index + 1);
+        }
+        for threads in [1, 2, 4, 8] {
+            let mut settings = options();
+            settings.threads.max_threads = threads;
+            let tree = scan_dir(temp.path(), &settings);
+            assert_eq!(tree.files, 96);
+            assert_eq!(tree.dirs, 193);
+            assert_eq!(tree.bytes, (1..=96).sum::<u64>());
+        }
+    }
+
+    #[test]
+    fn cancelled_queued_jobs_release_parent_completion_tokens() {
+        let temp = TempDir::new().expect("tempdir");
+        for index in 0..128 {
+            write(temp.path(), &format!("d{index}/file"), 1);
+        }
+        let progress = Arc::new(ScanProgress::default());
+        let context = Arc::new(WalkContext {
+            known: None,
+            options: options(),
+            progress: Arc::clone(&progress),
+            root_device: Mutex::new(None),
+            foreign_mounts: OnceLock::new(),
+            never_scanned: OnceLock::new(),
+            visited_dirs: Mutex::new(FxHashSet::default()),
+            root: Mutex::new(None),
+        });
+        let root =
+            Arc::new(PendingDir::new(temp.path().to_path_buf(), None, 0));
+        let queued = walk(&root, &context);
+        assert_eq!(queued.len(), 128);
+        assert!(lock(&context.root).is_none());
+        progress.cancel();
+        for dir in queued {
+            assert!(walk(&dir, &context).is_empty());
+        }
+        let tree = lock(&context.root).take().expect("root completed");
+        assert_eq!(tree.children.len(), 128);
+        assert!(tree.children.iter().all(|child| child.children.is_empty()));
     }
 
     #[test]

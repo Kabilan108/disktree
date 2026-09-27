@@ -12,6 +12,7 @@ pub mod filter;
 pub mod insights;
 pub mod removal;
 pub mod scan;
+pub mod scan_threads;
 pub mod size;
 pub mod space;
 pub mod tree;
