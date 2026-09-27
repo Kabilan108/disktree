@@ -40,9 +40,21 @@ make install
 `sudo make install PREFIX=/usr/local` installs system-wide; `make uninstall`
 removes exactly what was installed.
 
+On Arch, including Omarchy, disktree is in the AUR:
+[`disktree`](https://aur.archlinux.org/packages/disktree) builds each release
+from source, and
+[`disktree-bin`](https://aur.archlinux.org/packages/disktree-bin) installs
+the release binary:
+
+```sh
+yay -S disktree-bin
+```
+
 You need Rust 1.97 or newer and a Wayland or X11 session with a GPU that GPUI
 can drive (Vulkan). Distributions often package an older Rust;
-[rustup](https://rustup.rs) installs a current one.
+[rustup](https://rustup.rs) installs a current one. The repo pins 1.97 in
+`rust-toolchain.toml`, so with rustup the right toolchain is fetched on the
+first build even if `rustup default` points at something older.
 
 ### macOS
 
@@ -211,6 +223,8 @@ and shows how much free space was actually gained.
 | `d` | disk usage or apparent size |
 | `i` | include or skip hidden entries |
 | `r` | scan again |
+| `esc` while scanning | stop the scan |
+| `v` | scan another mounted volume |
 | `ctrl o` (`⌘O` on macOS) | choose another directory to scan |
 | `g` | the whole disk |
 | `p` | show or hide the selection line |
@@ -244,6 +258,14 @@ The scan follows [dust](https://github.com/bootandy/dust)'s approach: one rayon
 scope per root, a completion counter per directory so no directory is built
 before its last subdirectory lands, and one bottom-up pass that aggregates sizes
 and removes duplicate hardlinks.
+
+## Switching volumes
+
+Press `v` (or click **Volumes** beside the disk name in the side panel) to
+bring up the volume picker. It lists every candidate volume mounted on the
+system together with its free space, ordered fullest first, filtering out
+pseudo-filesystems and duplicate btrfs/APFS mount points. Selecting any
+entry resets the scan root directly to that volume.
 
 ## The whole disk
 
@@ -285,14 +307,31 @@ The same program, with Windows' answers to the questions above:
   folder another volume is mounted on is a link, like a junction, and is
   not entered, so a scan stays on one volume; `-l` follows links, and with
   them mounted folders.
+- **Run as administrator** and the whole disk is read from NTFS's master
+  file table instead of walked, as WizTree does: one pass over the table in
+  large reads. On a 4-million-file `C:\` that took about 3.4 s against 11.2
+  s for WizTree and about 20 s for the walk. It also sees what the walk is
+  refused, such as System Volume Information. It is used only for a whole
+  NTFS drive, since a folder would still cost the whole table, and not with
+  `-l`, whose links the table does not follow. disktree flushes the volume
+  after its own removals so the rescan shows them; changes other programs
+  made seconds before may not show yet.
+  Started without admin rights, disktree walks as before. On a whole NTFS
+  drive without `-l`, or once Windows refuses the walk a folder, the side
+  panel offers **Restart as Administrator**, which reopens the same folder
+  and options through the UAC prompt; during a widening scan, the wider
+  folder being scanned.
 - **Move to trash** is the Recycle Bin, through the shell, which asks
   before destroying anything it cannot recycle.
 - **Refused besides the rules below:** Windows, Program Files and
   ProgramData, what Windows keeps at the top of its drive (System Volume
   Information, Recovery, Boot, and the page and hibernation files, which
-  Settings turns off), and any folder holding your profile, such as
-  `C:\Users`. Names compare without regard to case, as Windows compares
-  them.
+  Settings turns off), any folder holding your profile, such as
+  `C:\Users`, and every profile in the folder Windows keeps them in
+  (`C:\Users\*`, `Public` and `Default` included), since an elevated
+  disktree may run as another account and can reach them all. What is
+  inside a profile can still be removed, as under your own. Names compare
+  without regard to case, as Windows compares them.
 - **Hidden** means a name starting with a dot, or the hidden attribute, so
   `-H` drops `AppData` as Explorer hides it.
 - **The theme** follows Windows' light or dark setting, since there is no

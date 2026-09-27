@@ -25,6 +25,12 @@ mod views;
 mod widgets;
 
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
+use std::{
+    io::IsTerminal as _,
+    os::unix::process::CommandExt as _,
+    process::{Command, Stdio},
+};
 
 use anyhow::{Context as _, Result};
 use disktree_core::scan::ScanOptions;
@@ -79,7 +85,31 @@ fn main() -> Result<()> {
 }
 
 fn run() -> Result<()> {
-    let args = parse_args()?;
+    let args = parse_args(std::env::args_os().skip(1))?;
+
+    // When the app executable is reached through the command-line symlink,
+    // cmux sends SIGTERM to its foreground process group as AppKit takes
+    // focus. Spawn once into a separate group before AppKit starts. Restrict
+    // this to interactive cmux sessions so scripts retain normal foreground
+    // lifetime; the marker prevents the child from spawning recursively.
+    #[cfg(target_os = "macos")]
+    if std::io::stdin().is_terminal()
+        && std::env::var_os("CMUX_SURFACE_ID").is_some()
+        && std::env::var_os("DISKTREE_CMUX_DETACHED").is_none()
+    {
+        Command::new(std::env::current_exe().context("find disktree")?)
+            .args(std::env::args_os().skip(1))
+            .env("DISKTREE_CMUX_DETACHED", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            // Zero makes the child the leader of a new process group.
+            .process_group(0)
+            .spawn()
+            .context("start disktree")?;
+        return Ok(());
+    }
+
     let root = args.root.clone();
     let depth = args.depth;
     let title_root = root.clone();
@@ -156,11 +186,10 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-fn parse_args() -> Result<Args> {
-    parse_args_from(std::env::args().skip(1))
-}
-
-fn parse_args_from(arguments: impl Iterator<Item = String>) -> Result<Args> {
+/// Read the command line, program name already skipped.
+fn parse_args(
+    mut args: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<Args> {
     let mut root: Option<PathBuf> = None;
     let mut options = ScanOptions::default();
     if cfg!(target_os = "macos") {
@@ -169,10 +198,17 @@ fn parse_args_from(arguments: impl Iterator<Item = String>) -> Result<Args> {
     }
     let mut depth = 3_u32;
     let mut disk = false;
-    let mut args = arguments;
+    // `std::env::args` panics on a name that is not Unicode, and a path is
+    // any name: a restart as administrator hands the root back exactly as
+    // it was, so the caller passes `args_os`.
+    let text = |value: Option<std::ffi::OsString>, need: &str| {
+        value
+            .and_then(|value| value.into_string().ok())
+            .with_context(|| need.to_owned())
+    };
 
     while let Some(arg) = args.next() {
-        match arg.as_str() {
+        match arg.to_str().unwrap_or_default() {
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -186,7 +222,7 @@ fn parse_args_from(arguments: impl Iterator<Item = String>) -> Result<Args> {
             "-X" | "--cross-filesystems" => options.one_filesystem = false,
             "-D" | "--disk" => disk = true,
             "-d" | "--depth" => {
-                let value = args.next().context("--depth needs a number")?;
+                let value = text(args.next(), "--depth needs a number")?;
                 depth = value.parse().context("--depth needs a number")?;
                 anyhow::ensure!(
                     (1..=6).contains(&depth),
@@ -194,8 +230,7 @@ fn parse_args_from(arguments: impl Iterator<Item = String>) -> Result<Args> {
                 );
             }
             "--scan-threads" => {
-                let value =
-                    args.next().context("--scan-threads needs a number")?;
+                let value = text(args.next(), "--scan-threads needs a number")?;
                 options.threads.max_threads = value
                     .parse()
                     .context("--scan-threads needs a positive integer")?;
@@ -206,9 +241,10 @@ fn parse_args_from(arguments: impl Iterator<Item = String>) -> Result<Args> {
             }
             "--fixed-threads" => options.threads.adaptive = false,
             "--thread-throughput-percent" => {
-                let value = args
-                    .next()
-                    .context("--thread-throughput-percent needs a number")?;
+                let value = text(
+                    args.next(),
+                    "--thread-throughput-percent needs a number",
+                )?;
                 let percent: u8 = value
                     .parse()
                     .context("throughput percent must be 1 to 100")?;
@@ -220,9 +256,10 @@ fn parse_args_from(arguments: impl Iterator<Item = String>) -> Result<Args> {
                     f64::from(percent) / 100.0;
             }
             "--thread-system-cpu-percent" => {
-                let value = args
-                    .next()
-                    .context("--thread-system-cpu-percent needs a number")?;
+                let value = text(
+                    args.next(),
+                    "--thread-system-cpu-percent needs a number",
+                )?;
                 let percent: u8 =
                     value.parse().context("CPU percent must be 0 to 100")?;
                 anyhow::ensure!(percent <= 100, "CPU percent must be 0 to 100");
@@ -230,7 +267,7 @@ fn parse_args_from(arguments: impl Iterator<Item = String>) -> Result<Args> {
                     (percent > 0).then(|| f64::from(percent) / 100.0);
             }
             "--metric" => {
-                let value = args.next().context("--metric needs a value")?;
+                let value = text(args.next(), "--metric needs a value")?;
                 options.metric = match value.as_str() {
                     "files" => disktree_core::tree::Metric::Files,
                     "bytes" | "size" => disktree_core::tree::Metric::Bytes,
@@ -245,9 +282,9 @@ fn parse_args_from(arguments: impl Iterator<Item = String>) -> Result<Args> {
             other if other.starts_with('-') => {
                 anyhow::bail!("unknown option {other}\n\n{USAGE}");
             }
-            path => {
+            _ => {
                 anyhow::ensure!(root.is_none(), "only one path can be scanned");
-                root = Some(PathBuf::from(path));
+                root = Some(PathBuf::from(arg));
             }
         }
     }
@@ -318,17 +355,17 @@ mod console {
 mod argument_tests {
     use super::*;
 
-    fn arguments(extra: &[&str]) -> impl Iterator<Item = String> {
+    fn arguments(extra: &[&str]) -> impl Iterator<Item = std::ffi::OsString> {
         extra
             .iter()
             .copied()
             .chain(std::iter::once("."))
-            .map(str::to_owned)
+            .map(std::ffi::OsString::from)
     }
 
     #[test]
     fn adaptive_budget_and_fixed_override_are_explicit() {
-        let args = parse_args_from(arguments(&[])).expect("defaults");
+        let args = parse_args(arguments(&[])).expect("defaults");
         assert_eq!(
             args.options.threads.max_threads,
             if cfg!(target_os = "macos") {
@@ -338,7 +375,7 @@ mod argument_tests {
             }
         );
         assert_eq!(args.options.threads.adaptive, cfg!(target_os = "macos"));
-        let args = parse_args_from(arguments(&[
+        let args = parse_args(arguments(&[
             "--scan-threads",
             "4",
             "--fixed-threads",
@@ -357,6 +394,30 @@ mod argument_tests {
         assert_eq!(args.options.threads.system_cpu_limit, None);
     }
 
+    // APFS rejects these filename bytes; Linux filesystems permit them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_options_preserve_a_non_unicode_root() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let root = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(vec![b'r', 0xff]));
+        std::fs::create_dir(&root).expect("directory");
+        let args = parse_args(
+            [
+                std::ffi::OsString::from("--scan-threads"),
+                std::ffi::OsString::from("4"),
+                root.clone().into_os_string(),
+            ]
+            .into_iter(),
+        )
+        .expect("native path");
+        assert_eq!(args.root, dunce::canonicalize(root).expect("root"));
+        assert_eq!(args.options.threads.max_threads, 4);
+    }
+
     #[test]
     fn invalid_worker_budgets_are_rejected() {
         for extra in [
@@ -366,7 +427,7 @@ mod argument_tests {
             vec!["--thread-throughput-percent", "101"],
             vec!["--thread-system-cpu-percent", "101"],
         ] {
-            assert!(parse_args_from(arguments(&extra)).is_err());
+            assert!(parse_args(arguments(&extra)).is_err());
         }
     }
 }
