@@ -430,6 +430,14 @@ struct CpuSampler {
     system: sysinfo::System,
 }
 
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    allow(
+        clippy::missing_const_for_fn,
+        clippy::unused_self,
+        reason = "The fallback mirrors the stateful, non-const native API."
+    )
+)]
 impl CpuSampler {
     fn new() -> Self {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
