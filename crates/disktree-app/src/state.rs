@@ -2605,10 +2605,17 @@ impl Disktree {
                     self.toggle_mark(&crumbs, cx);
                 }
             }
-            MouseButton::Navigate(NavigationDirection::Back) => {
+            // Buttons 8 and 9. gpui-pre maps them on X11, Wayland and
+            // Windows; a mouse with no side buttons never sends them, and
+            // then the header `<` / `>` and alt-arrows are the whole story.
+            MouseButton::Navigate(NavigationDirection::Back)
+                if self.screen == Screen::Explore =>
+            {
                 self.go_back(cx);
             }
-            MouseButton::Navigate(NavigationDirection::Forward) => {
+            MouseButton::Navigate(NavigationDirection::Forward)
+                if self.screen == Screen::Explore =>
+            {
                 self.go_forward(cx);
             }
             _ => {}
