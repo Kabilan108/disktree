@@ -569,6 +569,9 @@ fn media_roots(mounts: &[crate::space::MountView]) -> Vec<PathBuf> {
         .filter(|mount| {
             mount.point.starts_with("/run/media")
                 && mount.point != Path::new("/run/media")
+                // An overmounted disk can remain in mountinfo. Ambiguous
+                // stacked views must never grant a deletion exception.
+                && mounts.iter().filter(|other| other.point == mount.point).count() == 1
                 && mount.fs_root == Path::new("/")
                 && mount.source.starts_with("/dev/")
                 && matches!(
@@ -1591,6 +1594,11 @@ mod tests {
         ] {
             assert!(!on_media(Path::new(path), &points, &media), "{path}");
         }
+        let mut stacked = views.clone();
+        let mut covering = views[3].clone();
+        covering.point = PathBuf::from("/run/media/user/Games");
+        stacked.push(covering);
+        assert!(media_roots(&stacked).is_empty(), "overmounted disk");
         assert!(media_roots(&[]).is_empty());
     }
 
