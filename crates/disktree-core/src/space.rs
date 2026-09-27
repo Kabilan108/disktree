@@ -343,16 +343,6 @@ pub struct Volume {
     pub space: Option<SpaceInfo>,
 }
 
-impl Volume {
-    /// Free bytes for ranking; an unreadable volume sorts last.
-    const fn available(&self) -> u64 {
-        match &self.space {
-            Some(space) => space.available,
-            None => 0,
-        }
-    }
-}
-
 /// Every volume worth offering as a scan root, fullest first.
 ///
 /// Pseudo filesystems (`/proc`, `/sys`, tmpfs, …), snapshot subvolumes and
@@ -405,7 +395,13 @@ pub fn volumes_in(mounts: &[Mount]) -> Vec<Volume> {
 
 /// Fullest first; an unreadable volume sorts last.
 fn sort_by_free_space(volumes: &mut [Volume]) {
-    volumes.sort_by_key(|volume| std::cmp::Reverse(volume.available()));
+    volumes.sort_by_key(|volume| {
+        (
+            volume.space.is_none(),
+            volume.space.map_or(0, |space| space.available),
+            volume.point.clone(),
+        )
+    });
 }
 
 /// Whether the mount is a real disk worth scanning: a device-backed
@@ -514,6 +510,31 @@ systemd-1 /mnt/nas-home autofs rw,direct 0 0
 tmpfs /tmp tmpfs rw 0 0
 portal /run/user/1000/doc fuse.portal rw 0 0
 ";
+
+    #[test]
+    fn volumes_with_least_space_come_first_and_unknowns_last() {
+        let volume = |name: &str, available: Option<u64>| Volume {
+            point: PathBuf::from(name),
+            device: None,
+            space: available.map(|available| SpaceInfo {
+                total: 100,
+                free: available,
+                available,
+            }),
+        };
+        let mut volumes = vec![
+            volume("unknown", None),
+            volume("roomy", Some(90)),
+            volume("full", Some(0)),
+            volume("nearly-full", Some(5)),
+        ];
+        sort_by_free_space(&mut volumes);
+        let names: Vec<_> = volumes.iter().map(|v| v.point.clone()).collect();
+        assert_eq!(
+            names,
+            ["full", "nearly-full", "roomy", "unknown"].map(PathBuf::from)
+        );
+    }
 
     #[test]
     fn a_volume_includes_its_subvolumes_and_nothing_else() {

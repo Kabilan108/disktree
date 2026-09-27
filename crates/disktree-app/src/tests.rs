@@ -488,6 +488,35 @@ fn the_volume_picker_opens_moves_and_closes(cx: &mut TestAppContext) {
     assert_eq!(read(&view, cx, |app| app.root_path.clone()), before);
 }
 
+/// Enter must reach the picker even when its dialog owns keyboard focus.
+#[gpui_kit::test]
+fn enter_in_the_focused_volume_picker_scans_the_selected_root(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let target = temp.path().join("junk");
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, _| {
+        app.volumes = vec![disktree_core::space::Volume {
+            point: target.clone(),
+            device: None,
+            space: None,
+        }];
+        app.volume_highlight = 0;
+        app.volumes_open = true;
+    });
+    let focus = read(&view, cx, |app| app.confirm_focus.clone());
+    cx.update(|window, cx| window.focus(&focus, cx));
+    draw(cx);
+    assert!(!read(&view, cx, Disktree::can_start_over));
+    press(cx, "enter");
+    assert!(!read(&view, cx, |app| app.volumes_open));
+    assert_eq!(read(&view, cx, |app| app.root_path.clone()), target);
+    finish_scan(&view, cx);
+    assert!(read(&view, cx, |app| app.tree().is_some()));
+}
+
 #[gpui_kit::test]
 fn the_volume_picker_is_centred_and_still_dismisses_from_outside(
     cx: &mut TestAppContext,

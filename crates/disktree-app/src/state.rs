@@ -433,6 +433,8 @@ pub struct Disktree {
     /// on. `None` when closed; empty when no volume besides the current one
     /// could be read.
     pub volumes_open: bool,
+    pub volumes_loading: bool,
+    volume_epoch: u64,
     pub volumes: Vec<disktree_core::space::Volume>,
     pub volume_highlight: usize,
     /// The side panel's width, in rem; dragged from its left edge.
@@ -526,6 +528,8 @@ impl Disktree {
             restarting: false,
             disk_root: None,
             volumes_open: false,
+            volumes_loading: false,
+            volume_epoch: 0,
             volumes: Vec::new(),
             volume_highlight: 0,
             panel_rems: PANEL_REMS,
@@ -632,28 +636,58 @@ impl Disktree {
     /// is left alone until a volume is picked; picking calls [`set_root`],
     /// which cancels it.
     pub fn open_volumes(&mut self, cx: &mut Context<'_, Self>) {
-        let mut volumes = disktree_core::space::volumes();
-        // The current disk is always offered, even when the table misses it:
-        // it is the one row that is never wrong.
-        if let Some(root) = volume_root_for(&self.root_path)
-            && !volumes.iter().any(|volume| volume.point == root)
-        {
-            volumes.push(disktree_core::space::Volume {
-                point: root.clone(),
-                device: device_for(&root),
-                space: space_info(&root).ok(),
-            });
-        }
-        volumes.retain(|volume| volume.point != self.root_path);
+        self.volume_epoch += 1;
+        let epoch = self.volume_epoch;
+        let root_path = self.root_path.clone();
+        self.volumes.clear();
         self.volume_highlight = 0;
-        self.volumes = volumes;
+        self.volumes_loading = true;
         self.volumes_open = true;
+        self.focus_request = Some(FocusTarget::Dialog);
+        // Removable media and network volumes can take seconds to answer.
+        // Keep Escape and the window responsive while probing them.
+        let task = cx.background_executor().spawn(async move {
+            let mut volumes = disktree_core::space::volumes();
+            if let Some(root) = volume_root_for(&root_path)
+                && !volumes.iter().any(|volume| volume.point == root)
+            {
+                volumes.push(disktree_core::space::Volume {
+                    point: root.clone(),
+                    device: device_for(&root),
+                    space: space_info(&root).ok(),
+                });
+            }
+            volumes.retain(|volume| volume.point != root_path);
+            volumes
+        });
+        cx.spawn(async move |this, cx| {
+            let volumes = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.volumes_open && this.volume_epoch == epoch {
+                    this.volumes = volumes;
+                    this.volumes_loading = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Close the picker and return the keyboard to the treemap.
+    pub fn close_volumes(&mut self, cx: &mut Context<'_, Self>) {
+        self.volumes_open = false;
+        self.focus_request = Some(FocusTarget::Root);
         cx.notify();
     }
 
     /// Scan the highlighted volume from scratch; closes the picker when there
     /// is nothing to pick.
     pub fn choose_volume(&mut self, cx: &mut Context<'_, Self>) {
+        if self.volumes_loading {
+            return;
+        }
+        self.focus_request = Some(FocusTarget::Root);
         let Some(point) = self
             .volumes
             .get(self.volume_highlight)
@@ -2244,7 +2278,9 @@ impl Disktree {
     /// behind the confirmation, and not under the review list or a removal
     /// that is still running.
     pub fn can_start_over(&self) -> bool {
-        self.screen == Screen::Explore && !self.confirm_open
+        self.screen == Screen::Explore
+            && !self.confirm_open
+            && !self.volumes_open
     }
 
     /// Ask for a directory and scan it: an app opened from the Dock has no
@@ -2389,10 +2425,7 @@ impl Disktree {
         // picks, Escape closes, and nothing behind it acts.
         if self.volumes_open {
             match key {
-                "escape" => {
-                    self.volumes_open = false;
-                    cx.notify();
-                }
+                "escape" => self.close_volumes(cx),
                 "enter" => self.choose_volume(cx),
                 "up" | "k" if !control => {
                     self.move_volume_highlight(-1, cx);

@@ -134,7 +134,9 @@ fn volumes_dialog(
         .flex()
         .flex_col()
         .gap(space::XS);
-    if app.volumes.is_empty() {
+    if app.volumes_loading {
+        rows = rows.child(dialog_description("Looking for volumes…", cx));
+    } else if app.volumes.is_empty() {
         rows = rows
             .child(dialog_description("No other volume could be read.", cx));
     }
@@ -185,18 +187,24 @@ fn volumes_dialog(
         let close = cancel.clone();
         move |_, window, cx| {
             let _ = close.update(cx, |this, cx| {
-                this.volumes_open = false;
-                cx.notify();
+                this.close_volumes(cx);
                 this.apply_focus(window, cx);
             });
         }
     });
+    let accept = cx.entity().downgrade();
     alert_dialog(&app.confirm_focus, cx)
         .open(true)
+        .on_ok(move |_, window, cx| {
+            let _ = accept.update(cx, |this, cx| {
+                this.choose_volume(cx);
+                this.apply_focus(window, cx);
+            });
+            false
+        })
         .on_cancel(move |_, window, cx| {
             let _ = cancel.update(cx, |this, cx| {
-                this.volumes_open = false;
-                cx.notify();
+                this.close_volumes(cx);
                 this.apply_focus(window, cx);
             });
             false
@@ -226,7 +234,10 @@ fn centred_popup(
         .justify_center()
         // Any button, as the backdrop took them: a right-click outside closes
         // the dialog too.
-        .on_any_mouse_down(on_outside)
+        .on_any_mouse_down(move |event, window, cx| {
+            cx.stop_propagation();
+            on_outside(event, window, cx);
+        })
         .child(
             div()
                 .id("dialog-card")
@@ -1813,7 +1824,7 @@ fn disk_section(
                 .tab_stop(false)
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.open_volumes(cx);
-                    window.focus(&this.focus, cx);
+                    this.apply_focus(window, cx);
                 })),
         );
     let mut section = div().flex().flex_col().gap(space::SM).child(header);
@@ -3248,7 +3259,7 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
     let theme = cx.omarchy();
     // Sentence case, and the tile a key acts on is always the one under the
     // pointer if the pointer moved last, else the keyboard selection.
-    let rows: [(&str, &str); 28] = [
+    let rows = [
         ("space / x", "Mark or unmark the tile you point at"),
         (MODIFIER_CLICK, "Mark without moving the selection"),
         ("enter", "Open that directory, at any depth"),
