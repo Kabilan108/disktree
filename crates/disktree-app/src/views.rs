@@ -985,14 +985,17 @@ fn view_settings(
 }
 
 /// What the tooltip says the choice will do, where the gauge alone cannot.
-/// The numbers were measured on Apple silicon; elsewhere the fans are only
-/// a likely cost, not a measured one.
+/// Measured on an 18-core Apple silicon Mac scanning its whole Data volume
+/// (medians of three): 4 workers 209 s and 433 CPU-seconds, 8 workers 133 s
+/// and 580, 18 workers 137 s and 1,314. Elsewhere the shape is expected, not
+/// measured, so it gives no numbers.
 const POWER_TRADEOFF: &str = if cfg!(target_os = "macos") {
-    "Above Balanced, a scan finishes only about 20% sooner but uses about \
-     twice the CPU, and runs the fans at full speed."
+    "Up to about 8 workers a scan finishes sooner: a whole drive took a \
+     third less time with 8 than with Balanced. Past that it is no faster, \
+     but uses over twice the CPU and runs the fans at full speed."
 } else {
-    "Above Balanced, a scan finishes only about 20% sooner but uses about \
-     twice the CPU, and can run the fans at full speed."
+    "More workers finish a scan sooner only up to a point. Past it they \
+     use more CPU for no gain, and can run the fans at full speed."
 };
 
 /// How hard a scan may work, as a signal gauge framed like Depth; the
