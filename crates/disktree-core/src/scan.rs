@@ -19,6 +19,7 @@
 use std::fs::DirEntry;
 use std::fs::{self, Metadata};
 use std::io;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -774,18 +775,16 @@ impl PendingDir {
     /// Turn a completed directory into a node. Only called when `pending` has
     /// reached zero, so every child is already in `self.partial`.
     ///
-    /// `bytes` and `own_bytes` are left at zero on purpose: the walk cannot
-    /// know the aggregate, and [`crate::tree::aggregate`] derives both from the
-    /// children once every child is present.
+    /// `bytes` is left at zero on purpose: the walk cannot know the
+    /// aggregate, and [`crate::tree::aggregate`] derives it from the children
+    /// once every child is present.
     fn build(&self) -> Node {
         let partial = std::mem::take(&mut *lock(&self.partial));
         Node {
             name: partial.name,
             kind: NodeKind::Directory,
             bytes: 0,
-            own_bytes: 0,
             files: 0,
-            own_files: 0,
             dirs: 1,
             inode: None,
             read_error: self.read_error.load(Ordering::Relaxed),
@@ -842,7 +841,7 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
             let node = finish_tree(node, &context.options);
             // The reader counted every file on the volume; the tree may
             // hold fewer.
-            progress.settle(node.files, node.dirs, node.bytes);
+            progress.settle(node.files, u64::from(node.dirs), node.bytes);
             return Ok(node);
         }
         // The reader gave up, or never started: the walk counts from nothing.
@@ -920,7 +919,7 @@ impl Tally {
         if node.is_dir() {
             // A subtree taken whole from an earlier scan.
             self.files += node.files;
-            self.dirs += node.dirs;
+            self.dirs += node.dirs as u64;
         } else {
             // A link counts as a file on the meter, as it always has,
             // though the tree does not count it.
@@ -1065,7 +1064,9 @@ fn leaf_node(
 ) -> Node {
     let mut node = Node::entry(name, kind, facts.size);
     if track {
-        node.inode = facts.identity;
+        node.inode = facts
+            .identity
+            .and_then(|(device, file)| Some((device, NonZeroU64::new(file)?)));
     }
     node.modified = facts.modified;
     node
@@ -1288,8 +1289,8 @@ mod tests {
         write(root, "sub/deep.bin", 300);
 
         let tree = scan_dir(root, &options());
-        assert_eq!(tree.own_bytes, 700);
-        assert_eq!(tree.own_files, 1);
+        assert_eq!(tree.own_bytes(), 700);
+        assert_eq!(tree.own_files(), 1);
         assert_eq!(tree.bytes, 1000);
         assert_eq!(tree.files, 2);
     }
@@ -1448,7 +1449,7 @@ mod tests {
                 ..options()
             },
         );
-        assert_eq!(tree.own_bytes, 10);
+        assert_eq!(tree.own_bytes(), 10);
         let a = child(&tree, "a");
         assert_eq!(
             a.bytes, 20,

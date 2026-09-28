@@ -73,10 +73,13 @@ and `cargo build --release` directly; CI runs the gate on both systems.
    allocation, alternate data streams included since they go when the file
    goes, so for a file with alternate streams it can exceed the walk's
    number.
-2. **`own_bytes`/`own_files` are derived, never tracked.** `tree::aggregate`
-   computes the totals from the children. Hardlink de-duplication zeroes a
-   duplicate leaf's weight while that pass runs; anything that patches
-   `bytes` directly will be overwritten.
+2. **Totals are derived, never tracked.** A leaf's `bytes` is the only
+   input: `tree::aggregate` computes every directory's `bytes`, `files` and
+   `dirs` from its children, and `own_bytes()`/`own_files()` read the direct
+   children when asked. Hardlink de-duplication zeroes a duplicate leaf's
+   `bytes` while that pass runs; anything that patches a directory's `bytes`
+   directly will be overwritten. `Node` is paid for tens of millions of
+   times, so `a_node_stays_small` holds its size.
 3. **A directory is only built when its own scan *and* every subdirectory task
    has finished.** That is the `+1` sentinel in `PendingDir::pending`. Building
    early silently drops whole subtrees — it has happened once.
