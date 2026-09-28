@@ -15,7 +15,7 @@
 //! poll without locking, and cooperative cancellation so a re-scan can abandon
 //! a walk of a large home directory instead of queueing behind it.
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 use std::fs::DirEntry;
 use std::fs::{self, Metadata};
 use std::io;
@@ -468,10 +468,12 @@ impl WalkContext {
 
 /// What the walk reads about one directory entry.
 ///
-/// `std::fs::DirEntry` everywhere but Windows. There the standard listing
-/// has neither the allocated size nor a file id, so measuring like `du`
-/// would cost an open per file; [`crate::windows`] lists a directory with
-/// both instead.
+/// `std::fs::DirEntry` everywhere but Windows and macOS. On Windows the
+/// standard listing has neither the allocated size nor a file id, so
+/// measuring like `du` would cost an open per file; [`crate::windows`] lists
+/// a directory with both instead. On macOS it would cost an `lstat` per
+/// entry, and [`crate::macos`] lists a directory with everything a stat
+/// says.
 trait Listed {
     /// The entry's path inside `dir`, the directory it was listed from.
     fn entry_path(&self, dir: &Path) -> PathBuf;
@@ -488,7 +490,8 @@ trait Listed {
     fn directory(&self) -> io::Result<Directory>;
     /// Hidden by an attribute rather than by a leading dot: on Windows,
     /// where the listing carries it, so `AppData` is hidden as Explorer
-    /// hides it. macOS's `UF_HIDDEN` would cost a stat per entry.
+    /// hides it. Finder's `UF_HIDDEN` is not asked for: on macOS, hidden
+    /// means a leading dot, as on Linux.
     fn hidden(&self) -> bool {
         false
     }
@@ -539,13 +542,13 @@ impl Facts {
 }
 
 /// A standard directory entry with its name decoded once, up front.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 struct Named {
     entry: DirEntry,
     name: Box<str>,
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 impl Listed for Named {
     fn entry_path(&self, _dir: &Path) -> PathBuf {
         self.entry.path()
@@ -582,6 +585,50 @@ impl Listed for Named {
         self.entry.metadata().map(|meta| Directory {
             device: device_of(&meta),
             evicted: is_dataless(&meta),
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Listed for crate::macos::Entry {
+    fn entry_path(&self, dir: &Path) -> PathBuf {
+        self.path(dir)
+    }
+
+    fn name(&self) -> &str {
+        self.name()
+    }
+
+    fn take_name(&mut self) -> Box<str> {
+        self.take_name()
+    }
+
+    fn listing(&self) -> io::Result<Listing> {
+        Ok(match self.kind() {
+            crate::macos::Kind::Link => Listing::Symlink,
+            crate::macos::Kind::Directory => Listing::Directory,
+            crate::macos::Kind::File => Listing::Leaf(NodeKind::File),
+            crate::macos::Kind::Other => Listing::Leaf(NodeKind::Other),
+        })
+    }
+
+    fn facts(&self, apparent_size: bool) -> io::Result<Facts> {
+        Ok(Facts {
+            size: if apparent_size {
+                self.apparent()
+            } else {
+                self.allocated()
+            },
+            identity: Some(self.identity()),
+            modified: self.modified(),
+            shared: self.shared(),
+        })
+    }
+
+    fn directory(&self) -> io::Result<Directory> {
+        Ok(Directory {
+            device: self.device(),
+            evicted: self.evicted(),
         })
     }
 }
@@ -639,7 +686,7 @@ impl Listed for crate::windows::Entry {
 }
 
 /// List a directory the way [`Listed`] describes.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn list(
     path: &Path,
     _volume: Option<u64>,
@@ -653,6 +700,14 @@ fn list(
             entry,
         })
     }))
+}
+
+#[cfg(target_os = "macos")]
+fn list(
+    path: &Path,
+    _volume: Option<u64>,
+) -> io::Result<crate::macos::ReadDir> {
+    crate::macos::read_dir(path)
 }
 
 #[cfg(windows)]
