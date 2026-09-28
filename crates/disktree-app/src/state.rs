@@ -329,7 +329,12 @@ pub struct Disktree {
     pub options: ScanOptions,
     pub power_choice: Option<crate::power::PowerEfficiency>,
     pub power_settings_path: Option<PathBuf>,
-    pub power_menu_open: bool,
+    /// The Power Efficiency menu, when open: the row the arrow keys are on,
+    /// as an index into [`crate::power::PowerEfficiency::ALL`].
+    pub power_menu: Option<usize>,
+    /// The pointer is on the menu's button. A press there is the button's
+    /// to toggle, not a press outside the menu that closes it first.
+    pub power_hover: bool,
     pub cpu_threads: usize,
     pub tree: Option<Arc<Node>>,
     pub scan: Option<ScanHandle>,
@@ -468,7 +473,8 @@ impl Disktree {
             options,
             power_choice: None,
             power_settings_path: crate::power::settings_path(),
-            power_menu_open: false,
+            power_menu: None,
+            power_hover: false,
             cpu_threads: crate::power::cpu_threads(),
             tree: None,
             scan: None,
@@ -814,26 +820,99 @@ impl Disktree {
         preset: crate::power::PowerEfficiency,
         cx: &mut Context<'_, Self>,
     ) {
+        self.power_menu = None;
+        // Not offered here: it would run the same workers as the preset
+        // below it, under a name that promises more.
+        if !preset.available(self.cpu_threads) {
+            cx.notify();
+            return;
+        }
         self.options.threads = preset.policy(self.cpu_threads);
         self.power_choice = Some(preset);
-        self.power_menu_open = false;
+        let label = preset.label(self.cpu_threads);
         self.notice = Some(match self.power_settings_path.as_deref() {
             Some(path) => match crate::power::save(path, preset) {
                 Ok(()) => (
-                    format!("{} saved; applies to the next scan", preset.label(self.cpu_threads)),
+                    format!("{label} from the next scan; r rescans now"),
                     Status::Success,
                 ),
                 Err(error) => (
-                    format!("Applies to the next scan, but could not save Power Efficiency: {error}"),
+                    format!(
+                        "{label} from the next scan, but it could not be \
+                         saved: {error}"
+                    ),
                     Status::Warning,
                 ),
             },
             None => (
-                "Power Efficiency applies to the next scan; no settings directory is available".into(),
+                format!(
+                    "{label} from the next scan; no settings directory to \
+                     save it in"
+                ),
                 Status::Warning,
             ),
         });
         cx.notify();
+    }
+
+    /// Open the Power Efficiency menu on the current preset, or close it.
+    pub fn toggle_power_menu(&mut self, cx: &mut Context<'_, Self>) {
+        use crate::power::PowerEfficiency;
+        self.power_menu = if self.power_menu.is_some() {
+            None
+        } else {
+            // On the current preset, or the nearest one below it that this
+            // machine offers: a custom count starts from Balanced.
+            let current = self.power_choice.unwrap_or_default() as usize;
+            (0..=current)
+                .rev()
+                .find(|&index| {
+                    PowerEfficiency::ALL[index].available(self.cpu_threads)
+                })
+                .or(Some(0))
+        };
+        cx.notify();
+    }
+
+    /// Keys while the Power Efficiency menu is open, as the sibling menu
+    /// takes them. The arrows step over presets this machine cannot offer.
+    fn on_power_key(&mut self, key: &str, cx: &mut Context<'_, Self>) -> bool {
+        use crate::power::PowerEfficiency;
+        let Some(highlighted) = self.power_menu else {
+            return false;
+        };
+        let cpus = self.cpu_threads;
+        let offered: Vec<usize> = (0..PowerEfficiency::ALL.len())
+            .filter(|&index| PowerEfficiency::ALL[index].available(cpus))
+            .collect();
+        let step = |forward: bool| {
+            let next = if forward {
+                offered.iter().find(|&&index| index > highlighted)
+            } else {
+                offered.iter().rev().find(|&&index| index < highlighted)
+            };
+            next.copied().unwrap_or(highlighted)
+        };
+        match key {
+            "down" | "j" => self.power_menu = Some(step(true)),
+            "up" | "k" => self.power_menu = Some(step(false)),
+            "home" => self.power_menu = offered.first().copied(),
+            "end" => self.power_menu = offered.last().copied(),
+            "enter" | "space" => {
+                self.set_power_efficiency(
+                    PowerEfficiency::ALL[highlighted],
+                    cx,
+                );
+            }
+            "escape" => self.power_menu = None,
+            _ => {
+                self.power_menu = None;
+                cx.notify();
+                return false;
+            }
+        }
+        cx.notify();
+        true
     }
 
     /// Start a fresh scan, abandoning any walk still in progress.
@@ -2484,6 +2563,9 @@ impl Disktree {
         }
 
         if self.crumb_menu.is_some() && self.on_menu_key(key, cx) {
+            return;
+        }
+        if self.power_menu.is_some() && self.on_power_key(key, cx) {
             return;
         }
 

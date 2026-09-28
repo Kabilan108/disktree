@@ -55,9 +55,28 @@ impl PowerEfficiency {
     }
 
     pub fn label(self, cpus: usize) -> String {
-        let count = self.threads(cpus);
-        let unit = if count == 1 { "thread" } else { "threads" };
-        format!("{} ({count} {unit})", self.name())
+        format!("{} ({})", self.name(), workers(self.threads(cpus)))
+    }
+
+    /// A preset that would run no more workers than the one below it, on a
+    /// machine with this many CPUs, is a duplicate there and is not offered.
+    pub fn available(self, cpus: usize) -> bool {
+        // Declared in `ALL` order, so the discriminant is the index.
+        let index = self as usize;
+        index == 0 || self.threads(cpus) > Self::ALL[index - 1].threads(cpus)
+    }
+
+    /// How many of the four gauge bars `threads` workers fill: the presets
+    /// offered here that run no more than that, so a custom count reads on
+    /// the same scale.
+    pub fn signal(threads: usize, cpus: usize) -> usize {
+        Self::ALL
+            .into_iter()
+            .filter(|preset| {
+                preset.available(cpus) && preset.threads(cpus) <= threads
+            })
+            .count()
+            .max(1)
     }
 
     pub fn policy(self, cpus: usize) -> ScanThreads {
@@ -68,6 +87,11 @@ impl PowerEfficiency {
             ..ScanThreads::default()
         }
     }
+}
+
+pub fn workers(count: usize) -> String {
+    let unit = if count == 1 { "worker" } else { "workers" };
+    format!("{count} {unit}")
 }
 
 pub fn cpu_threads() -> usize {
@@ -134,8 +158,34 @@ mod tests {
         assert_eq!(PowerEfficiency::Balanced.threads(3), 3);
         assert_eq!(
             PowerEfficiency::DrainMyBattery.label(18),
-            "Drain My Battery (18 threads)"
+            "Drain My Battery (18 workers)"
         );
+    }
+
+    #[test]
+    fn presets_that_add_no_workers_are_not_offered() {
+        use PowerEfficiency as P;
+        let offered = |cpus| {
+            P::ALL
+                .into_iter()
+                .filter(|preset| preset.available(cpus))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(offered(18), P::ALL);
+        assert_eq!(offered(10), P::ALL);
+        assert_eq!(offered(8), [P::Miser, P::Balanced, P::Aggressive]);
+        assert_eq!(offered(6), [P::Miser, P::Balanced, P::Aggressive]);
+        assert_eq!(offered(4), [P::Miser, P::Balanced]);
+        assert_eq!(offered(3), [P::Miser, P::Balanced]);
+        assert_eq!(offered(2), [P::Miser]);
+        assert_eq!(offered(1), [P::Miser]);
+        // The gauge counts what is offered, so a small machine running
+        // everything it has reads as full as the menu allows.
+        assert_eq!(P::signal(4, 18), 2);
+        assert_eq!(P::signal(18, 18), 4);
+        assert_eq!(P::signal(4, 4), 2);
+        assert_eq!(P::signal(1, 18), 1);
+        assert_eq!(P::signal(12, 18), 3);
     }
 
     #[test]

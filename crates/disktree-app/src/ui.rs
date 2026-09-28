@@ -72,6 +72,11 @@ pub mod size {
     /// A crumb's sibling menu.
     pub const SIBLING_MENU: Rems = Rems(24.0);
     pub const SIBLING_MENU_HEIGHT: Rems = Rems(32.0);
+    /// The Power Efficiency menu: narrower than a sibling menu, since its
+    /// names are four known words.
+    pub const POWER_MENU: Rems = Rems(20.0);
+    /// One bar of the Power Efficiency gauge.
+    pub const SIGNAL_BAR: Rems = Rems(0.1875);
     /// A list row's share bar.
     pub const ROW_BAR: Rems = Rems(5.5);
     /// A legend or identity swatch.

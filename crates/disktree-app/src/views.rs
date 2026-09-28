@@ -476,10 +476,13 @@ fn trail(app: &Disktree, theme: &Theme, cx: &Context<'_, Disktree>) -> Div {
     } else {
         0..0
     };
+    // Short of room, the trail gives up its start, never the crumb you are
+    // in and its menu: content packed to the end overflows to the left.
     let mut row = div()
         .flex()
         .flex_row()
         .items_center()
+        .justify_end()
         .gap(space::XXS)
         .min_w_0()
         .overflow_hidden();
@@ -969,113 +972,196 @@ fn view_settings(
 
     div()
         .flex()
-        .flex_col()
-        .items_end()
-        .gap(space::XS)
+        .flex_row()
+        .items_center()
+        .gap(space::SM)
         .flex_shrink_0()
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(space::SM)
-                .child(history)
-                .child(mode)
-                .child(hidden)
-                .child(apparent)
-                .child(depth_control),
-        )
+        .child(history)
+        .child(mode)
+        .child(hidden)
+        .child(apparent)
+        .child(depth_control)
         .child(power_efficiency(app, cx))
 }
 
-/// Keep the four labeled choices in a popup so even the smallest window can
-/// show the controls. Like the other settings, focus returns to the treemap.
+/// What the tooltip says the choice will do, where the gauge alone cannot.
+/// The numbers were measured on Apple silicon; elsewhere the fans are only
+/// a likely cost, not a measured one.
+const POWER_TRADEOFF: &str = if cfg!(target_os = "macos") {
+    "Above Balanced, a scan finishes only about 20% sooner but uses about \
+     twice the CPU, and runs the fans at full speed."
+} else {
+    "Above Balanced, a scan finishes only about 20% sooner but uses about \
+     twice the CPU, and can run the fans at full speed."
+};
+
+/// How hard a scan may work, as a signal gauge framed like Depth; the
+/// presets are in a menu built like the sibling menu, so the control costs
+/// the bar no more than one button. Like the other settings, focus returns
+/// to the treemap.
 fn power_efficiency(app: &Disktree, cx: &Context<'_, Disktree>) -> Div {
-    let label = app.power_choice.map_or_else(
-        || "Custom".to_owned(),
-        |preset| preset.label(app.cpu_threads),
-    );
-    let mut control = div().relative().child(
-        div()
-            .id("power-efficiency")
-            .debug_selector(|| "power-efficiency".into())
-            .child(
-                button(
-                    "power-toggle",
-                    format!("Power Efficiency: {label}"),
-                    ButtonVariant::Secondary,
-                    cx,
-                )
+    use crate::power::{self, PowerEfficiency};
+
+    let theme = cx.omarchy().clone();
+    let cpus = app.cpu_threads;
+    let threads = app.options.threads.max_threads.min(cpus);
+    let name = app.power_choice.map_or("Custom", PowerEfficiency::name);
+    let open = app.power_menu.is_some();
+    let trigger = div()
+        .id("power-efficiency")
+        .debug_selector(|| "power-efficiency".into())
+        .flex()
+        .flex_row()
+        .items_center()
+        .border_1()
+        .border_color(theme.control_border())
+        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+            this.power_hover = *hovered;
+            cx.notify();
+        }))
+        .child(
+            button("power-toggle", "", ButtonVariant::Secondary, cx)
+                .accessibility_label(format!("Power Efficiency: {name}"))
+                .selected(open)
                 .tab_stop(false)
-                .on_click(cx.listener(
-                    |this, _, window, cx| {
-                        this.power_menu_open = !this.power_menu_open;
-                        window.focus(&this.focus, cx);
-                        cx.notify();
-                    },
-                )),
-            ),
-    );
-    if app.power_menu_open {
-        let theme = cx.omarchy().clone();
-        let mut menu = div()
-            .id("power-menu")
-            .debug_selector(|| "power-menu".into())
-            .occlude()
-            .flex()
-            .flex_col()
-            .w(size::SIBLING_MENU)
-            .p(space::SM)
-            .gap(space::XS)
-            .bg(theme.surface)
-            .border_1()
-            .border_color(theme.control_border())
-            .shadow_lg()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.power_menu_open = false;
-                cx.notify();
-            }));
-        for preset in crate::power::PowerEfficiency::ALL {
-            let variant = if app.power_choice == Some(preset) {
-                ButtonVariant::Primary
-            } else {
-                ButtonVariant::Secondary
-            };
-            menu = menu.child(
-                div()
-                    .id(preset.key())
-                    .debug_selector(move || preset.key().into())
-                    .child(
-                        button(
-                            preset.key(),
-                            preset.label(app.cpu_threads),
-                            variant,
-                            cx,
-                        )
-                        .w_full()
-                        .tab_stop(false)
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.set_power_efficiency(preset, cx);
-                                window.focus(&this.focus, cx);
-                            },
-                        )),
-                    ),
-            );
-        }
-        menu = menu.child(div().text_size(text::CAPTION)
-            .text_color(theme.secondary)
-            .child("Saved for the next scan. Limits scan workers, not whole-app CPU or battery use."));
-        control = control.child(
-            div().absolute().top_full().right_0().child(
-                deferred(
-                    anchored()
-                        .snap_to_window_with_margin(px(space::SM.0 * app.rem))
-                        .child(menu),
+                .child(widgets::signal(
+                    PowerEfficiency::signal(threads, cpus),
+                    cx,
+                ))
+                .child(
+                    div()
+                        .text_size(text::CAPTION)
+                        .text_color(theme.secondary)
+                        .child("\u{25be}"),
                 )
-                .with_priority(2),
-            ),
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.toggle_power_menu(cx);
+                    window.focus(&this.focus, cx);
+                })),
         );
+    // An open menu says it all; the tooltip would only cover it.
+    let trigger = if open {
+        trigger
+    } else {
+        with_tooltip(
+            trigger,
+            format!(
+                "Power Efficiency: {name} \u{00b7} {} of {cpus} CPUs\n\
+                 {POWER_TRADEOFF}\nUsed from the next scan, and remembered.",
+                power::workers(threads)
+            ),
+        )
+    };
+    let mut control = div().relative().child(trigger);
+    let Some(highlighted) = app.power_menu else {
+        return control;
+    };
+
+    let mut menu = div()
+        .id("power-menu")
+        .debug_selector(|| "power-menu".into())
+        .occlude()
+        .flex()
+        .flex_col()
+        .w(size::POWER_MENU)
+        .p(space::XS)
+        .bg(theme.surface)
+        .border_1()
+        .border_color(theme.control_border())
+        .shadow_lg()
+        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+            if !this.power_hover {
+                this.power_menu = None;
+                cx.notify();
+            }
+        }))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_between()
+                .px(space::SM)
+                .py(space::XS)
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary.opacity(0.8))
+                .child("Scan workers")
+                .child(format!("{cpus} CPUs")),
+        );
+    for (index, preset) in PowerEfficiency::ALL.into_iter().enumerate() {
+        let offered = preset.available(cpus);
+        let current = app.power_choice == Some(preset);
+        let count = preset.threads(cpus);
+        let row = div()
+            .id(preset.key())
+            .debug_selector(move || preset.key().into())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(space::MD)
+            .px(space::SM)
+            .py(space::XS)
+            .when(index == highlighted && offered, |this| {
+                this.bg(theme.hover_fill())
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(text::BODY)
+                    .text_color(theme.bright)
+                    .when(current, |this| this.font_weight(FontWeight::BOLD))
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(preset.name()),
+            )
+            .child(div().flex_shrink_0().w(size::ROW_BAR).child(widgets::bar(
+                count as f32 / cpus as f32,
+                theme.accent,
+                cx,
+            )))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .w(size::SIZE_LANE)
+                    .flex()
+                    .justify_end()
+                    .text_size(text::BODY)
+                    .text_color(theme.secondary)
+                    .child(power::workers(count)),
+            );
+        // A preset this machine cannot tell apart from the one below it is
+        // shown, so the scale stays the same everywhere, but not offered.
+        let row = if offered {
+            row.hover(|style| style.bg(theme.hover_fill())).on_click(
+                cx.listener(move |this, _, window, cx| {
+                    this.set_power_efficiency(preset, cx);
+                    window.focus(&this.focus, cx);
+                }),
+            )
+        } else {
+            let below = PowerEfficiency::ALL[index - 1].name();
+            with_tooltip(
+                row.opacity(0.45),
+                format!("Same as {below} with {cpus} CPUs"),
+            )
+        };
+        menu = menu.child(row);
     }
+    control = control.child(
+        div().absolute().top_full().right_0().child(
+            deferred(
+                // Hung from the gauge's right edge: the bar's last control,
+                // so the menu opens inward rather than off the window.
+                anchored()
+                    .anchor(gpui_kit::Anchor::TopRight)
+                    .snap_to_window_with_margin(px(8.))
+                    .offset(gpui_kit::point(px(0.), px(4.)))
+                    .child(menu),
+            )
+            .with_priority(2),
+        ),
+    );
     control
 }
 
