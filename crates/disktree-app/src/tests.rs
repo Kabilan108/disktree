@@ -1736,6 +1736,15 @@ fn the_power_menu_offers_only_what_the_cpus_can_tell_apart(
     draw(cx);
     assert_eq!(read(&view, cx, |app| app.power_menu), Some(1));
 
+    // The pointer takes the highlight, and the check stays on what is saved.
+    let miser = cx.debug_bounds(Power::Miser.key()).expect("row");
+    cx.simulate_mouse_move(miser.center(), None, Modifiers::none());
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.power_menu), Some(0));
+    let balanced = cx.debug_bounds(Power::Balanced.key()).expect("row");
+    let check = cx.debug_bounds("power-check").expect("check");
+    assert!(balanced.contains(&check.center()), "check on {check:?}");
+
     // A disabled row ignores the click and leaves the menu to be dismissed.
     let drain = cx.debug_bounds(Power::DrainMyBattery.key()).expect("row");
     cx.simulate_click(drain.center(), Modifiers::none());

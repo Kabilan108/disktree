@@ -1106,6 +1106,15 @@ fn power_efficiency(app: &Disktree, cx: &Context<'_, Disktree>) -> Div {
             .when(index == highlighted && offered, |this| {
                 this.bg(theme.hover_fill())
             })
+            // The saved preset keeps its check wherever the highlight goes;
+            // bold alone read as losing to the fill under the pointer.
+            .child(div().flex_shrink_0().w(icon::SM).when(current, |this| {
+                this.debug_selector(|| "power-check".into()).child(
+                    gpui_omarchy::icon(gpui_omarchy::IconName::Check)
+                        .size(icon::SM)
+                        .text_color(theme.accent),
+                )
+            }))
             .child(
                 div()
                     .flex_1()
@@ -1136,12 +1145,18 @@ fn power_efficiency(app: &Disktree, cx: &Context<'_, Disktree>) -> Div {
         // A preset this machine cannot tell apart from the one below it is
         // shown, so the scale stays the same everywhere, but not offered.
         let row = if offered {
-            row.hover(|style| style.bg(theme.hover_fill())).on_click(
-                cx.listener(move |this, _, window, cx| {
-                    this.set_power_efficiency(preset, cx);
-                    window.focus(&this.focus, cx);
-                }),
-            )
+            // The pointer moves the one highlight the arrows move, so two
+            // filled rows never compete with the check.
+            row.on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if *hovered && this.power_menu.is_some() {
+                    this.power_menu = Some(index);
+                    cx.notify();
+                }
+            }))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.set_power_efficiency(preset, cx);
+                window.focus(&this.focus, cx);
+            }))
         } else {
             let below = PowerEfficiency::ALL[index - 1].name();
             with_tooltip(
