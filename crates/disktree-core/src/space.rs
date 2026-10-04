@@ -269,14 +269,16 @@ fn covering<'a>(mounts: &'a [Mount], path: &Path) -> Option<&'a Mount> {
 /// source: its files share their blocks with the live ones, so removing them
 /// gives back almost nothing, and the scan keeps out of it for the same
 /// reason. The mount the scan itself asked for is kept at all events, since
-/// removing something there empties the very space the meter reads.
+/// removing something there empties the very space the meter reads. Only
+/// the other mount is tested, as [`foreign_mounts`] does: a system booted
+/// from a snapshot (openSUSE's Snapper default) has one at `/`, and its
+/// `/var` and `/home` are still the scan's own.
 fn same_volume(own: &Mount, other: &Mount) -> bool {
     if own.point == other.point {
         return true;
     }
     own.source == other.source
         && own.fstype == other.fstype
-        && !is_snapshot(own)
         && !is_snapshot(other)
 }
 
@@ -1131,6 +1133,25 @@ portal /run/user/1000/doc fuse.portal rw 0 0
             ),
             Attribution::Other
         );
+    }
+
+    /// openSUSE boots from a Snapper snapshot, so `/` itself is one; the
+    /// scan still walks `/var` and `/home`, and so does the projection.
+    #[test]
+    fn a_root_booted_from_a_snapshot_keeps_its_subvolumes() {
+        let mounts = parse_mounts(
+            "/dev/vda2 / btrfs rw,subvol=/@/.snapshots/1/snapshot 0 0\n\
+             /dev/vda2 /var btrfs rw,subvol=/@/var 0 0\n\
+             /dev/vda2 /home btrfs rw,subvol=/@/home 0 0\n",
+        );
+        assert!(foreign_mounts(&mounts, Path::new("/")).is_empty());
+        for path in ["/var/cache/x", "/home/me/x", "/usr/x"] {
+            assert_eq!(
+                attribution(Some(&mounts), Path::new("/"), Path::new(path)),
+                Attribution::Scanned,
+                "{path}"
+            );
+        }
     }
 
     #[test]

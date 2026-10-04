@@ -460,9 +460,13 @@ impl<'a> Cursor<'a> {
         self.at += 8;
         let flags = self.u32()?;
         let inode = self.u64()?;
-        // A directory's own size is never measured; its entries are.
+        // A directory is stated the ordinary way. A mount point is listed
+        // with the attributes of the directory it covers, so its DEVID is
+        // the parent volume's, and the walk would cross into every disk,
+        // share and system volume mounted below the root. `statat` reads
+        // the mounted root, as `lstat` did; directories are few beside files.
         let (links, allocated, apparent) = if kind == Kind::Directory {
-            (1, 0, 0)
+            return Ok(None);
         } else if file & FILE_ATTRIBUTES == FILE_ATTRIBUTES {
             (self.u32()?, self.u64()?, self.u64()?)
         } else {
