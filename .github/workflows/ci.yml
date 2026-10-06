@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 # Pull requests run here, so the token can read and nothing more.
 permissions:
@@ -161,8 +162,39 @@ jobs:
 
       - uses: cachix/install-nix-action@v31
 
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        with:
+          name: kabilan108
+          # Upload explicitly after the build so an upload failure fails CI.
+          skipPush: true
+
+      - name: Require cache credentials for main
+        if: >-
+          github.repository == 'Kabilan108/disktree' &&
+          github.ref == 'refs/heads/main' &&
+          github.event_name != 'pull_request'
+        env:
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        run: |
+          if [ -z "$CACHIX_AUTH_TOKEN" ]; then
+            echo "::error::Add the CACHIX_AUTH_TOKEN repository secret with write access to kabilan108."
+            exit 1
+          fi
+
       - name: Check flake outputs
         run: nix flake check --no-build
 
       - name: Build installable package
-        run: nix build --no-link .#disktree
+        run: nix build --out-link result .#disktree
+
+      - name: Publish package closure to Cachix
+        if: >-
+          github.repository == 'Kabilan108/disktree' &&
+          github.ref == 'refs/heads/main' &&
+          github.event_name != 'pull_request'
+        env:
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        run: |
+          package=$(readlink -f result)
+          cachix push kabilan108 "$package"
+          nix path-info --store https://kabilan108.cachix.org "$package"

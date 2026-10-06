@@ -142,6 +142,19 @@ The shell supplies Rust and the native libraries required by GPUI, including
 Fontconfig. If you use direnv, run `direnv allow` once in this checkout. The
 `.envrc` then loads the shell when you enter the directory.
 
+### Nix binary cache
+
+The fork's CI builds the package on `main` and publishes its closure to
+`https://kabilan108.cachix.org`. Configure the GitHub repository secret
+`CACHIX_AUTH_TOKEN` with a Cachix token that can write to `kabilan108`.
+Pull requests build without publishing. The CI workflow can also be run
+manually after adding or rotating the token.
+
+Consumers should keep this flake's locked Nixpkgs input rather than making
+it follow their own Nixpkgs. A different input produces a different package
+store path, which misses the CI cache. In `~/dotfiles`, both hosts already
+trust this cache and install `inputs.disktree.packages.x86_64-linux.default`.
+
 ## Use
 
 ```sh
